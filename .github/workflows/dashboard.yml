@@ -1,0 +1,74 @@
+# Collect settlement gas data from public Arbitrum Sepolia RPCs and publish the
+# static dashboard to GitHub Pages. Runs hourly; every run is incremental and
+# checkpointed, so a run that hits its time budget simply resumes next hour.
+#
+# Repo settings needed once: Settings → Pages → Source = "GitHub Actions".
+# Optional secret RPC_URLS (comma-separated) to add a keyed provider for speed.
+name: gas-dashboard
+
+on:
+  schedule:
+    - cron: "7 * * * *"       # hourly, off the top of the hour (GitHub cron is contended at :00)
+  workflow_dispatch:
+    inputs:
+      max_run_minutes:
+        description: "Collector time budget (minutes)"
+        default: "45"
+
+permissions:
+  contents: write            # commit data/ back to the repo
+  pages: write
+  id-token: write
+
+concurrency:
+  group: gas-dashboard
+  cancel-in-progress: false   # never kill a run mid-chunk; it checkpoints and exits on its own
+
+jobs:
+  collect-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Collect
+        env:
+          RPC_URLS: ${{ secrets.RPC_URLS }}          # empty → built-in public endpoints
+          MAX_RUN_MINUTES: ${{ github.event.inputs.max_run_minutes || '45' }}
+        run: node collect.mjs
+
+      - name: Commit data
+        run: |
+          git config user.name "gas-dashboard[bot]"
+          git config user.email "gas-dashboard@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then echo "no data change"; exit 0; fi
+          git commit -m "data: through block $(node -p "require('./data/state.json').lastBlock")"
+          # another run may have pushed meanwhile (manual dispatch + cron): rebase, never force
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Assemble site
+        run: |
+          rm -rf _site && mkdir -p _site
+          cp -r site/. _site/
+          mkdir -p _site/data
+          cp data/index.json _site/data/
+          cp -r data/days _site/data/
+          echo "$(date -u +%FT%TZ)" > _site/build.txt
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

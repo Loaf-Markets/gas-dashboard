@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settlement Gas — Arbitrum Sepolia</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛽</text></svg>">
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f6f6f4; --surface: #fcfcfb; --border: #e3e2dd;
+    --text: #0b0b0b; --text-2: #52514e; --text-3: #7d7c77;
+    --ours: #2a78d6; --ours-soft: rgba(42,120,214,.18);
+    --rest: #a3a29b; --rest-soft: rgba(163,162,155,.28);
+    --s2: #eb6834; --s3: #1baf7a; --s4: #4a3aa7;
+    --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
+    --grid: rgba(0,0,0,.07); --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211; --surface: #1a1a19; --border: #2c2c2a;
+      --text: #ffffff; --text-2: #c3c2b7; --text-3: #8d8c85;
+      --ours: #3987e5; --ours-soft: rgba(57,135,229,.25);
+      --rest: #7b7a74; --rest-soft: rgba(123,122,116,.3);
+      --s2: #d95926; --s3: #199e70; --s4: #9085e9;
+      --grid: rgba(255,255,255,.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; }
+  a { color: var(--ours); text-decoration: none; } a:hover { text-decoration: underline; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 20px 20px 60px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; font-weight: 650; letter-spacing: -.01em; }
+  header .meta { color: var(--text-2); font-size: 13px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
+  header .meta .stale { color: var(--critical); font-weight: 600; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin: 18px 0 14px; padding: 12px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+  .controls label { color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-right: 6px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; background: transparent; color: var(--text-2); padding: 6px 11px; cursor: pointer; font: inherit; font-size: 13px; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button[aria-pressed="true"] { background: var(--ours); color: #fff; }
+  .controls input[type=datetime-local] { font: inherit; font-size: 13px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; min-height: 92px; }
+  .tile .k { color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .tile .v { font-size: 24px; font-weight: 650; letter-spacing: -.01em; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
+  .tile .s { color: var(--text-3); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px 10px; min-width: 0; }
+  .card.wide { grid-column: 1 / -1; }
+  .card h2 { font-size: 14px; font-weight: 650; margin: 0 0 2px; }
+  .card .sub { color: var(--text-3); font-size: 12px; margin-bottom: 8px; }
+  .chart { position: relative; height: 260px; }
+  .chart.tall { height: 380px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); margin: 6px 0 2px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--text-2); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.ours td { background: var(--ours-soft); font-weight: 600; }
+  .tablewrap { overflow-x: auto; }
+  .note { color: var(--text-3); font-size: 12px; margin-top: 8px; }
+  details.help { margin-top: 20px; color: var(--text-2); }
+  details.help summary { cursor: pointer; font-weight: 600; color: var(--text); }
+  details.help p, details.help li { max-width: 900px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); color: var(--text-2); vertical-align: 1px; }
+  .pill.good { color: var(--good); border-color: var(--good); } .pill.warn { color: #9a6a00; border-color: var(--warn); } .pill.bad { color: var(--critical); border-color: var(--critical); }
+  #loading { color: var(--text-2); padding: 40px 0; text-align: center; }
+  #error { color: var(--critical); padding: 20px 0; display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Loaf settlement gas — Arbitrum Sepolia</h1>
+    <div class="meta" id="meta">loading…</div>
+  </header>
+
+  <div class="controls" id="controls" hidden>
+    <div><label>Range</label><span class="seg" id="range">
+      <button data-r="6h">6h</button><button data-r="24h" aria-pressed="true">24h</button><button data-r="3d">3d</button><button data-r="7d">7d</button><button data-r="all">All</button><button data-r="custom">Custom</button>
+    </span></div>
+    <div id="customRange" hidden><input type="datetime-local" id="from"> → <input type="datetime-local" id="to"> <button id="applyCustom" class="pill">apply</button></div>
+    <div><label>Contract</label><span class="seg" id="focus"></span></div>
+    <div><label>Bucket</label><span class="seg" id="gran">
+      <button data-g="minute">Minute</button><button data-g="hour" aria-pressed="true">Hour</button><button data-g="day">Day</button><button data-g="round">Round</button>
+    </span></div>
+    <div style="margin-left:auto;color:var(--text-3);font-size:12px" id="rangeInfo"></div>
+  </div>
+
+  <div id="loading">Loading data…</div>
+  <div id="error"></div>
+
+  <div id="app" hidden>
+    <div class="tiles" id="tiles"></div>
+
+    <div class="grid">
+      <div class="card wide">
+        <h2>Gas consumed per bucket</h2>
+        <div class="sub">The selected Loaf contract's settlement transactions vs everything else on the chain. Stacked, so the top edge is total chain gas in that bucket.</div>
+        <div class="legend"><span><i style="background:var(--ours)"></i><span id="lg-gas-ours">Loaf</span></span><span><i style="background:var(--rest)"></i>Rest of chain</span></div>
+        <div class="chart" id="c-gas"></div>
+      </div>
+
+      <div class="card">
+        <h2>Our share of chain gas</h2>
+        <div class="sub">Percent of all gas used in the bucket that the selected Loaf contract consumed. Prod and staging are separate contracts on the same chain; "All Loaf" sums them.</div>
+        <div class="chart" id="c-share"></div>
+      </div>
+
+      <div class="card">
+        <h2>Our gas rate vs the chain's speed limits</h2>
+        <div class="sub">Average gas per second in the bucket, against the sustained targets Arbitrum publishes (ArbGasInfo constraints). Crossing a target for longer than its window raises the base fee.</div>
+        <div class="legend"><span><i style="background:var(--ours)"></i><span id="lg-rate-ours">Loaf gas/s</span></span><span><i style="background:var(--rest)"></i>Whole chain gas/s</span><span><i style="background:var(--s2);height:2px"></i>Lowest (indefinite) target</span></div>
+        <div class="chart" id="c-rate"></div>
+      </div>
+
+      <div class="card wide">
+        <h2>Base fee elevation — measured, and what it would be without our load</h2>
+        <div class="sub">Base fee as a multiple of the chain minimum. The dashed line is the measured fee with our gas removed from every block, using Arbitrum's own six-constraint pricing model; the gap between it and the measured line is the elevation we cause. The thin "replay" line is the same model run cold on all gas, so you can judge how well it tracks reality.</div>
+        <div class="legend"><span><i style="background:var(--s2)"></i>Measured base fee</span><span><i style="background:var(--ours)"></i>Model replay (all gas)</span><span><i style="background:var(--s3)"></i><span id="lg-fee-nous">Without Loaf gas</span></span></div>
+        <div class="chart" id="c-fee"></div>
+        <div class="note" id="fee-note"></div>
+      </div>
+
+      <div class="card wide">
+        <h2>What our gas cost, and why</h2>
+        <div class="sub">ETH paid per bucket by our relayers, split into the floor price, the elevation premium caused by other traffic, and the premium caused by our own load.</div>
+        <div class="legend"><span><i style="background:var(--ours)"></i>At minimum base fee</span><span><i style="background:var(--s4)"></i>Premium from others' load</span><span><i style="background:var(--s2)"></i>Premium from our own load</span></div>
+        <div class="chart" id="c-cost"></div>
+      </div>
+
+      <div class="card wide">
+        <h2>Who burns the gas on this chain</h2>
+        <div class="sub" id="top-sub"></div>
+        <div class="chart tall" id="c-top"></div>
+        <div class="tablewrap"><table id="t-top"></table></div>
+      </div>
+
+      <div class="card wide">
+        <h2>Rounds</h2>
+        <div class="sub" id="rounds-sub"></div>
+        <div class="tablewrap"><table id="t-rounds"></table></div>
+      </div>
+
+      <div class="card wide">
+        <h2>The chain's published speed limits</h2>
+        <div class="sub">Live ArbGasInfo pricing constraints: sustained load above a target for longer than its window raises the base fee. The last column converts each target into settlement throughput at today's ~177k gas per trade.</div>
+        <div class="tablewrap"><table id="t-limits"></table></div>
+      </div>
+
+      <div class="card wide">
+        <h2>Bucket table</h2>
+        <div class="sub">The same numbers as the charts, for the selected range and bucket.</div>
+        <div class="tablewrap"><table id="t-buckets"></table></div>
+      </div>
+    </div>
+
+    <details class="help">
+      <summary>How to read this dashboard</summary>
+      <p><b>Source.</b> Everything here is computed from public chain data by a scheduled collector (no bridge or Grafana access needed). "Our" gas is every transaction that emitted an event on the selected Loaf settlement contract (prod and staging are separate contracts on the same chain). Transactions that reverted at the top level emit no events and are not counted, which slightly undercounts our spend.</p>
+      <p><b>Share of chain gas.</b> Chain gas is the exact sum of block <code>gasUsed</code>. Our gas is exact from receipts. The "who burns the gas" ranking is <i>sampled</i> (full receipts for 1 in N blocks, then scaled) so it is an estimate; our row in that table uses the same sampled basis so the ranks are comparable, and the tile above it shows the exact figure.</p>
+      <p><b>Base fee elevation.</b> Arbitrum (ArbOS 51) prices gas with six constraints, each a (target gas/s, window) pair with its own backlog. Every block, each backlog drains at its target and grows by the block's gas; the base fee is the minimum fee × Q(E) where E is the sum of backlog/(window × target) and Q is a quartic approximation of exp. The collector replays this exactly from block headers, once with all gas and once with our gas subtracted. "Our contribution" is 1 − Q(E without us)/Q(E). The model starts cold and needs the longest window (24 h) of history before the "without our gas" line and the "elevation we cause" figures are complete; until then they are understated. The <i>fit</i> figure in the header is the median error between the warmed model and the measured base fee.</p>
+      <p><b>Cost split.</b> Floor = gas × minimum base fee. Premium = gas × (paid price − minimum). The share of that premium attributed to our own load is the model's contribution fraction; the rest is attributed to other traffic. Arbitrum Sepolia currently charges no L1 posting fee, so this is pure L2 execution cost; on mainnet an L1 component would come on top and is not affected by congestion.</p>
+      <p><b>Rounds.</b> Trade ids are raw uint64 values that restart near 1 when a competition round resets. The collector opens a new round when an id drops below a quarter of the previous maximum.</p>
+    </details>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
