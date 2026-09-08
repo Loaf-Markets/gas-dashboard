@@ -64,7 +64,7 @@
   function addRow(b, r) {
     const c = cf(r);
     // rates are over COVERED time only (a backfill gap must not dilute them)
-    b.seconds += r.blocks > 0 ? 60 : 0; b.blocks += r.blocks; b.chainGas += r.chainGas; b.sampled += r.sampled; b.sampledTxs += r.sampledTxs; b.chainGas += r.chainGas; b.sampled += r.sampled; b.sampledTxs += r.sampledTxs;
+    b.seconds += r.blocks > 0 ? 60 : 0; b.blocks += r.blocks; b.chainGas += r.chainGas; b.sampled += r.sampled; b.sampledTxs += r.sampledTxs;
     b.ourTxs += c.txs; b.ourGas += c.gas; b.ourTrades += c.trades; b.ourFailed += c.failed;
     b.ourFeeEth += c.feeEth; b.ourPremiumEth += c.premiumEth; b.ourSelfPremiumEth += c.selfPremiumEth; b.othersPremiumCausedEth += c.causedEth;
     b.bfW += r.baseFeeAvg * r.blocks; b.qActW += r.qAct * r.blocks; b.qNoUsW += c.qNo * r.blocks; b.qModelW += r.qModel * r.blocks;
