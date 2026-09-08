@@ -18,6 +18,9 @@ on:
       max_run_minutes:
         description: "Collector time budget (minutes)"
         default: "45"
+      chained:
+        description: "Set by the workflow itself when it schedules its successor (a chained run checkpoints on the 6 h rule, a manual one always)"
+        default: "false"
 
 permissions:
   contents: write            # commit data/ back to the repo
@@ -70,7 +73,8 @@ jobs:
         run: |
           last=$(cat data/.checkpoint 2>/dev/null || echo 0)
           age=$(( $(date +%s) - last ))
-          if [ "$age" -ge 21600 ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          manual=$([ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.chained }}" != "true" ] && echo yes || echo no)
+          if [ "$age" -ge 21600 ] || [ "$manual" = "yes" ]; then
             date +%s > data/.checkpoint; echo "commit=true" >> "$GITHUB_OUTPUT"; echo "checkpoint (last one ${age}s ago)"
           else
             echo "commit=false" >> "$GITHUB_OUTPUT"; echo "last checkpoint ${age}s ago; cache only"
@@ -127,4 +131,4 @@ jobs:
           else
             echo "backfill still running; re-dispatching immediately"
           fi
-          gh workflow run gas-dashboard --ref "${GITHUB_REF_NAME}"
+          gh workflow run gas-dashboard --ref "${GITHUB_REF_NAME}" -f chained=true
