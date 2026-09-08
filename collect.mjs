@@ -225,6 +225,7 @@ async function initState() {
     lastMaxTradeId: Object.fromEntries(NAMES.map((n) => [n, 0])),
     sampleEvery: SAMPLE_EVERY,
     fit: null,
+    eventStats: { tradeSettledByShape: 0, failedByShape: 0, other: 0 },
   };
 }
 
@@ -315,8 +316,18 @@ async function processChunk(from, to) {
     const h = l.transactionHash;
     let t = txs.get(h);
     if (!t) { t = { n: toInt(l.blockNumber), who: ADDR_TO_NAME.get(l.address.toLowerCase()), trades: 0, failed: 0, ids: [] }; txs.set(h, t); }
-    if (l.topics[0] === TOPIC_TRADE_SETTLED) { t.trades++; t.ids.push(BigInt(l.topics[1])); }
-    else if (l.topics[0] === TOPIC_SETTLEMENT_FAILED) t.failed++;
+    // Match by signature hash first; fall back to event SHAPE so a proxy upgrade that
+    // re-declares TradeSettled (topic0 changes) cannot silently zero the trade count.
+    // TradeSettled: 3 indexed (tradeId, buyer, seller) + 6 words of data.
+    // SettlementFailed: 1 indexed (tradeId) + ABI-encoded string.
+    const nTopics = l.topics.length, dataWords = (l.data.length - 2) / 64;
+    if (l.topics[0] === TOPIC_TRADE_SETTLED || (nTopics === 4 && dataWords === 6)) {
+      t.trades++; t.ids.push(BigInt(l.topics[1]));
+      if (l.topics[0] !== TOPIC_TRADE_SETTLED) state.eventStats.tradeSettledByShape++;
+    } else if (l.topics[0] === TOPIC_SETTLEMENT_FAILED || (nTopics === 2 && dataWords >= 3)) {
+      t.failed++;
+      if (l.topics[0] !== TOPIC_SETTLEMENT_FAILED) state.eventStats.failedByShape++;
+    } else state.eventStats.other++;
   }
   const rcalls = [...txs.keys()].map((h) => ({ method: "eth_getTransactionReceipt", params: [h] }));
   await runBatches(rcalls, TX_RECEIPT_BATCH, (g, res) => {
@@ -492,6 +503,7 @@ function writeIndex() {
     sampleEvery: state.sampleEvery,
     modelWarmAt: state.model.warmAt,
     fit: state.fit,
+    eventStats: state.eventStats,
     rounds: state.rounds,
     labels,
     days: summaries,
@@ -508,6 +520,7 @@ function writeIndex() {
     const { minBaseFee, constraints } = await readChainParams();
     if (constraints.length === state.constraints.length) state.constraints = constraints.map(({ target, window }) => ({ target, window }));
     state.minBaseFee = minBaseFee;
+    state.eventStats ||= { tradeSettledByShape: 0, failedByShape: 0, other: 0 };
   }
   const latest = toInt(await rpc("eth_blockNumber", []));
   const tip = latest - CONFIRMATIONS;

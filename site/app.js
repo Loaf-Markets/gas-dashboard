@@ -255,7 +255,8 @@
       `data through block ${fmtNum(m.lastBlock)} (${fmtDur(lag)} behind now)`,
       `history since ${fmtDateTime(Math.min(...m.days.map((d) => d.firstT)))}`,
       m.fit ? `replay fit ±${fmtPct(m.fit.medianAbsErr, 1)}` : `model replay warming up`,
-    ].join(" · ");
+      m.eventStats && (m.eventStats.tradeSettledByShape || m.eventStats.failedByShape) ? `<span class="stale">event signature changed on chain: ${fmtNum(m.eventStats.tradeSettledByShape + m.eventStats.failedByShape)} events matched by shape — check labels.json / collector</span>` : "",
+    ].filter(Boolean).join(" · ");
   }
   function renderLimits() {
     const cons = state.meta.constraints || [];
@@ -281,16 +282,33 @@
       onPick(btn.dataset[attr]);
     });
   }
+  function readHash() {
+    const h = new URLSearchParams(location.hash.slice(1));
+    if (h.get("range")) state.range = h.get("range");
+    if (h.get("bucket")) state.gran = h.get("bucket");
+    if (h.get("focus")) state.focus = h.get("focus");
+    if (h.get("from") && h.get("to")) { state.custom = [Number(h.get("from")), Number(h.get("to"))]; state.range = "custom"; }
+  }
+  function writeHash() {
+    const h = new URLSearchParams({ range: state.range, bucket: state.gran, focus: state.focus });
+    if (state.range === "custom" && state.custom) { h.set("from", state.custom[0]); h.set("to", state.custom[1]); }
+    history.replaceState(null, "", "#" + h.toString());
+  }
+  function pressOnly(id, attr, value) {
+    document.querySelectorAll(`${id} button`).forEach((x) => x.setAttribute("aria-pressed", String(x.dataset[attr] === value)));
+  }
   function wire() {
-    seg("#range", "r", (v) => { state.range = v; $("#customRange").hidden = v !== "custom"; if (v !== "custom") render().catch(showErr); });
-    seg("#gran", "g", (v) => { state.gran = v; render().catch(showErr); });
+    seg("#range", "r", (v) => { state.range = v; $("#customRange").hidden = v !== "custom"; if (v !== "custom") { writeHash(); render().catch(showErr); } });
+    seg("#gran", "g", (v) => { state.gran = v; writeHash(); render().catch(showErr); });
     const fz = $("#focus");
-    fz.innerHTML = [...state.meta.tracked.map((t) => t.name), "all"].map((n, i) => `<button data-f="${n}" aria-pressed="${i === 0}">${n === "all" ? "All Loaf" : n[0].toUpperCase() + n.slice(1)}</button>`).join("");
-    seg("#focus", "f", (v) => { state.focus = v; render().catch(showErr); });
+    fz.innerHTML = [...state.meta.tracked.map((t) => t.name), "all"].map((n) => `<button data-f="${n}">${n === "all" ? "All Loaf" : n[0].toUpperCase() + n.slice(1)}</button>`).join("");
+    seg("#focus", "f", (v) => { state.focus = v; writeHash(); render().catch(showErr); });
     $("#applyCustom").addEventListener("click", () => {
       const f = Date.parse($("#from").value + "Z") / 1000, t = Date.parse($("#to").value + "Z") / 1000;
-      if (Number.isFinite(f) && Number.isFinite(t) && t > f) { state.custom = [f, t]; render().catch(showErr); }
+      if (Number.isFinite(f) && Number.isFinite(t) && t > f) { state.custom = [f, t]; writeHash(); render().catch(showErr); }
     });
+    pressOnly("#range", "r", state.range); pressOnly("#gran", "g", state.gran); pressOnly("#focus", "f", state.focus);
+    $("#customRange").hidden = state.range !== "custom";
     matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => render().catch(showErr));
   }
   function showErr(e) { $("#error").style.display = "block"; $("#error").textContent = "Failed to load dashboard data: " + e.message; console.error(e); }
@@ -299,9 +317,11 @@
     try {
       state.meta = await getJson("index.json");
       state.focus = state.meta.tracked[0].name;
+      readHash();
+      if (!state.meta.tracked.some((t) => t.name === state.focus) && state.focus !== "all") state.focus = state.meta.tracked[0].name;
       renderMeta(); wire();
       const lastT = state.meta.lastBlockTs; const iso = (t) => new Date(t * 1000).toISOString().slice(0, 16);
-      $("#from").value = iso(lastT - 86400); $("#to").value = iso(lastT);
+      $("#from").value = iso(state.custom ? state.custom[0] : lastT - 86400); $("#to").value = iso(state.custom ? state.custom[1] : lastT);
       $("#controls").hidden = false; $("#app").hidden = false; $("#loading").remove();
       await render();
     } catch (e) { showErr(e); }

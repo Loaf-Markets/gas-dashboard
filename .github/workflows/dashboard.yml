@@ -1,6 +1,7 @@
 # Collect settlement gas data from public Arbitrum Sepolia RPCs and publish the
-# static dashboard to GitHub Pages. Runs hourly; every run is incremental and
-# checkpointed, so a run that hits its time budget simply resumes next hour.
+# static dashboard to GitHub Pages. Runs every 30 min; every run is incremental and
+# checkpointed, so a run that hits its time budget simply resumes on the next tick
+# (the concurrency group queues at most one follow-up run behind a long one).
 #
 # Repo settings needed once: Settings → Pages → Source = "GitHub Actions".
 # Optional secret RPC_URLS (comma-separated) to add a keyed provider for speed.
@@ -8,7 +9,7 @@ name: gas-dashboard
 
 on:
   schedule:
-    - cron: "7 * * * *"       # hourly, off the top of the hour (GitHub cron is contended at :00)
+    - cron: "7,37 * * * *"    # every 30 min, off the top of the hour (GitHub cron is contended at :00)
   workflow_dispatch:
     inputs:
       max_run_minutes:
