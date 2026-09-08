@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write            # commit data/ back to the repo
+  actions: write             # re-dispatch this workflow
   pages: write
   id-token: write
 
@@ -105,3 +106,22 @@ jobs:
           path: _site
       - id: deploy
         uses: actions/deploy-pages@v4
+
+      # GitHub's cron is best-effort (it is often late or skipped under load), so a
+      # successful run schedules its own successor: immediately while the backfill is
+      # still catching up, otherwise ~10 min after this run started. Cron stays as a
+      # backup; the concurrency group keeps runs from overlapping.
+      - name: Schedule the next run
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          done=$(node -p "const s=require('./data/state.json'); !s.cursors.backfill || s.cursors.backfill.lastBlock >= s.cursors.backfill.endBlock")
+          if [ "$done" = "true" ]; then
+            start=$(date -d "$(gh run view ${{ github.run_id }} --json createdAt --jq .createdAt)" +%s)
+            wait=$(( 600 - ( $(date +%s) - start ) ))
+            if [ "$wait" -gt 0 ]; then echo "backfill done; sleeping ${wait}s before the next run"; sleep "$wait"; fi
+          else
+            echo "backfill still running; re-dispatching immediately"
+          fi
+          gh workflow run gas-dashboard --ref "${GITHUB_REF_NAME}"
