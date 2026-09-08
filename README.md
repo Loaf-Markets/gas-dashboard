@@ -69,6 +69,21 @@ Scheduled workflows on GitHub are paused after 60 days without repo activity; th
 hourly data commits count as activity, so this does not bite unless the collector
 itself stops committing.
 
+## Engineering notes
+
+- `npm test` runs the unit tests (`node --test`): the ArbOS quartic and its inverse,
+  minute-row round-tripping, the round detector, and the seam merge. The workflow runs
+  them before every collection.
+- RPC batches that come back with per-item errors (e.g. `response too large` from a
+  size-capped provider) are split and retried; a chunk that still fails ends the run
+  cleanly with the last checkpoint kept and the error shown in the page header, so the
+  site still deploys and the next run retries.
+- Actions are pinned to commit SHAs (Dependabot opens monthly bumps); the chart library
+  is loaded with Subresource Integrity; the page is `noindex`.
+- Every successful run schedules its own successor. If the chain ever stops (a failure
+  breaks it), the `*/10` cron restarts it on its next tick, or run
+  `gh workflow run gas-dashboard --repo Loaf-Markets/gas-dashboard` by hand.
+
 ## Run locally
 
 ```bash
