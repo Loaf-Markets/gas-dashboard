@@ -61,21 +61,30 @@ jobs:
           MAX_RUN_MINUTES: ${{ github.event.inputs.max_run_minutes || '45' }}
         run: node collect.mjs
 
+      - name: Decide whether to checkpoint into git (every 6 h, or on manual dispatch)
+        id: ckpt
+        run: |
+          last=$(cat data/.checkpoint 2>/dev/null || echo 0)
+          age=$(( $(date +%s) - last ))
+          if [ "$age" -ge 21600 ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            date +%s > data/.checkpoint; echo "commit=true" >> "$GITHUB_OUTPUT"; echo "checkpoint (last one ${age}s ago)"
+          else
+            echo "commit=false" >> "$GITHUB_OUTPUT"; echo "last checkpoint ${age}s ago; cache only"
+          fi
+
       - name: Save data to cache
         uses: actions/cache/save@v4
         with:
           path: data
           key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_id }}
 
-      - name: Checkpoint data into git (every 6 h)
+      - name: Checkpoint data into git
+        if: steps.ckpt.outputs.commit == 'true'
         run: |
           git config user.name "gas-dashboard[bot]"
           git config user.email "gas-dashboard@users.noreply.github.com"
-          last=$(git log -1 --format=%ct -- data/state.json || echo 0)
-          age=$(( $(date +%s) - ${last:-0} ))
           git add data
           if git diff --cached --quiet; then echo "no data change"; exit 0; fi
-          if [ "$age" -lt 21600 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then echo "last checkpoint ${age}s ago; skipping commit"; git reset -q; exit 0; fi
           git commit -m "data: live through block $(node -p "require('./data/state.json').cursors.live.lastBlock")"
           # another run may have pushed meanwhile: rebase, never force
           git pull --rebase origin "${GITHUB_REF_NAME}"
