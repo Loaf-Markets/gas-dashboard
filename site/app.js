@@ -63,7 +63,7 @@
   }
   function addRow(b, r) {
     const c = cf(r);
-    b.seconds += 60; b.blocks += r.blocks; b.chainGas += r.chainGas; b.sampled += r.sampled; b.sampledTxs += r.sampledTxs;
+    b.seconds += r.blocks > 0 ? 60 : 0; b.blocks += r.blocks; // rates are over COVERED time only (a backfill gap must not dilute them) b.chainGas += r.chainGas; b.sampled += r.sampled; b.sampledTxs += r.sampledTxs;
     b.ourTxs += c.txs; b.ourGas += c.gas; b.ourTrades += c.trades; b.ourFailed += c.failed;
     b.ourFeeEth += c.feeEth; b.ourPremiumEth += c.premiumEth; b.ourSelfPremiumEth += c.selfPremiumEth; b.othersPremiumCausedEth += c.causedEth;
     b.bfW += r.baseFeeAvg * r.blocks; b.qActW += r.qAct * r.blocks; b.qNoUsW += c.qNo * r.blocks; b.qModelW += r.qModel * r.blocks;
@@ -271,7 +271,7 @@
   function renderOverview(rows, a, b) {
     const m = state.meta; const min = m.minBaseFee; const t = total(rows);
     const name = focusName();
-    const spanDays = (b - a) / 86400;
+    const spanDays = t.seconds / 86400;
     const rangeWord = state.range === "custom" ? "in the selected period" : state.range === "all" ? "over all collected history" : `in the last ${state.range.replace("h", " hours").replace("d", " days")}`;
     const floor = m.constraints?.length ? Math.min(...m.constraints.map((c) => c.target)) : null;
     const others = Object.entries(t.per).filter(([k]) => k !== "all" && k !== state.focus);
@@ -327,7 +327,7 @@
     const perMin = t.seconds ? t.ourTrades / (t.seconds / 60) : 0;
     $("#s-volume").innerHTML = `<h3>How busy were we?</h3>
       <div class="big">${fmtNum(t.ourTrades)}<small>trades settled${t.ourFailed ? `, ${fmtNum(t.ourFailed)} failed legs` : ""}</small></div>
-      <p>That is about <b>${fmtNum(perMin)} trades per minute</b> in <b>${fmtNum(t.ourTxs)}</b> on-chain transactions${spanDays >= 1 ? `, or <b>${fmtNum(t.ourTrades / spanDays)} trades per day</b>` : ""}. ${floor ? `The chain can sustain roughly <b>${fmtNum(floor / 177000 * 60)} trades per minute</b> of our kind of work before the price starts rising, if nobody else were using it.` : ""}</p>`;
+      <p>That is about <b>${fmtNum(perMin)} trades per minute</b> in <b>${fmtNum(t.ourTxs)}</b> on-chain transactions${spanDays >= 0.5 ? `, or a pace of <b>${fmtNum(t.ourTrades / spanDays)} trades per day</b>` : ""}. ${floor ? `The chain can sustain roughly <b>${fmtNum(floor / 177000 * 60)} trades per minute</b> of our kind of work before the price starts rising, if nobody else were using it.` : ""}</p>`;
 
     // 6. others
     const N = m.sampleEvery; const agg = new Map(); let otherGasSum = 0;
