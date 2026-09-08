@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 // Settlement gas collector — Arbitrum (Nitro) chains. Zero dependencies, Node >= 20.
 //
-// Scans blocks incrementally from `data/state.json` and writes one JSON file per
-// UTC day under `data/days/`, plus `data/index.json` (summary + metadata the page
-// loads first). Everything is derived from public chain data — no secrets, no
-// bridge access. Safe to re-run: every chunk is checkpointed.
+// Scans blocks incrementally and writes one JSON file per UTC day under `data/days/`,
+// plus `data/index.json` (summary + metadata the page loads first). Everything is
+// derived from public chain data — no secrets, no bridge access. Every chunk is
+// checkpointed in `data/state.json`, so a run that hits its time budget resumes.
+//
+// Two cursors, so the page is CURRENT after the first run and history fills in behind:
+//   live      — starts LIVE_HOURS before the tip on the first run, then follows the tip;
+//               always processed first.
+//   backfill  — starts BACKFILL_DAYS before the tip and walks forward until it meets the
+//               live cursor's start block; processed with whatever time budget is left.
 //
 // Per block it collects
 //   - header:        timestamp, gasUsed (chain-wide), baseFeePerGas
@@ -22,7 +28,8 @@
 //   RPC_URLS           comma-separated JSON-RPC endpoints (round-robin, adaptive pacing)
 //   TRACKED            name=address[,name=address…]; first entry is the primary (default: prod + staging)
 //   DATA_DIR           output dir (default ./data)
-//   BACKFILL_DAYS      first-run history depth (default 3)
+//   LIVE_HOURS         how far behind the tip the live cursor starts on a fresh state (default 6)
+//   BACKFILL_DAYS      history depth the backfill cursor walks (default 3; <= LIVE_HOURS/24 disables it)
 //   MAX_RUN_MINUTES    stop cleanly after this long (default 45; GH Actions job budget)
 //   SAMPLE_EVERY       full-receipt sampling stride (default 200)
 //   HEADER_BATCH       blocks per eth_getBlockByNumber batch request (default 100)
@@ -37,15 +44,19 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Measured 2026-09-08: all four serve batched headers ×100, tx receipts ×100, block
+// receipts ×10 and eth_getLogs; each throttles per IP at roughly one batch per second.
 const ENDPOINTS = (process.env.RPC_URLS ||
-  "https://sepolia-rollup.arbitrum.io/rpc,https://arbitrum-sepolia-rpc.publicnode.com")
+  "https://sepolia-rollup.arbitrum.io/rpc,https://arbitrum-sepolia-rpc.publicnode.com,https://arbitrum-sepolia.rpc.thirdweb.com,https://api.zan.top/arb-sepolia")
   .split(",").map((s) => s.trim()).filter(Boolean);
 const TRACKED = (process.env.TRACKED ||
   "prod=0xA1467Ffdc95CD2821736ee5b044E14E72CB80FD4,staging=0x3f29c4ac2f18a6963dfe3dddb53efefeb3c8e594")
   .split(",").map((s) => s.trim()).filter(Boolean).map((kv) => { const [name, addr] = kv.split("="); return { name: name.trim(), addr: addr.trim().toLowerCase() }; });
 const NAMES = TRACKED.map((t) => t.name);
+const CKEYS = [...NAMES, "all"];
 const ADDR_TO_NAME = new Map(TRACKED.map((t) => [t.addr, t.name]));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const LIVE_HOURS = Number(process.env.LIVE_HOURS || 6);
 const BACKFILL_DAYS = Number(process.env.BACKFILL_DAYS || 3);
 const MAX_RUN_MS = Number(process.env.MAX_RUN_MINUTES || 45) * 60_000;
 const SAMPLE_EVERY = Number(process.env.SAMPLE_EVERY || 200);
@@ -64,14 +75,16 @@ const TOP_PER_HOUR = 120; // addresses kept per hour in the sampled ranking
 
 const t0 = Date.now();
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const budgetLeft = () => MAX_RUN_MS - (Date.now() - t0);
 
 // ───────────────────────────── RPC layer ─────────────────────────────
 let rr = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Per-endpoint pacing (AIMD): a throttle response multiplies the endpoint's minimum
-// request interval, every success decays it. Public RPCs limit per-IP request rate,
-// so this keeps each endpoint just under its limit instead of bouncing off 429s.
-const pace = new Map(ENDPOINTS.map((ep) => [ep, { minInterval: 250, nextAt: 0, cooldownUntil: 0 }]));
+// request interval, every success decays it. Consecutive throttles put the endpoint in
+// a penalty box that doubles each time (a provider on a daily quota drops out of the
+// rotation instead of eating retry attempts). Public RPCs limit per-IP request rate.
+const pace = new Map(ENDPOINTS.map((ep) => [ep, { minInterval: 250, nextAt: 0, cooldownUntil: 0, strikes: 0 }]));
 function pickEndpoint() {
   let best = null;
   for (let i = 0; i < ENDPOINTS.length; i++) {
@@ -89,29 +102,31 @@ let throttleEvents = 0;
 async function rpcBatch(calls) {
   if (calls.length === 0) return [];
   const body = JSON.stringify(calls.map((c, i) => ({ jsonrpc: "2.0", id: i, method: c.method, params: c.params })));
-  const MAX_ATTEMPTS = 16;
+  const MAX_ATTEMPTS = 20;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const { ep, readyAt } = pickEndpoint();
     const p = pace.get(ep);
     const wait = readyAt - Date.now();
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) await sleep(Math.min(wait, 30_000));
     p.nextAt = Date.now() + p.minInterval;
     try {
       const res = await fetch(ep, { method: "POST", headers: { "content-type": "application/json" }, body, signal: AbortSignal.timeout(120_000) });
-      let throttled = res.status === 429 || res.status >= 500;
+      let throttled = res.status === 429 || res.status >= 500 || res.status === 403;
       let arr = null;
       if (!throttled) {
         const json = await res.json();
         arr = Array.isArray(json) ? json : [json];
-        throttled = arr.some((r) => r.error && (r.error.code === 429 || r.error.code === -32005 || /rate|too many|limit exceeded/i.test(r.error.message || "")));
+        throttled = arr.some((r) => r.error && (r.error.code === 429 || r.error.code === -32005 || r.error.code === -32012 || /rate|too many|limit exceeded|no longer/i.test(r.error.message || "")));
       }
       if (throttled) {
         throttleEvents++;
+        p.strikes++;
         p.minInterval = Math.min(8000, p.minInterval * 1.6);
-        p.cooldownUntil = Date.now() + Math.min(20_000, 1500 * (attempt + 1));
-        if (attempt >= 6) log(`  throttled by ${new URL(ep).host} (${calls[0].method} ×${calls.length}, attempt ${attempt + 1}); interval now ${p.minInterval | 0}ms`);
+        p.cooldownUntil = Date.now() + Math.min(600_000, 1500 * 2 ** Math.min(p.strikes, 9));
+        if (p.strikes >= 5 && p.strikes % 5 === 0) log(`  ${new URL(ep).host}: ${p.strikes} consecutive throttles (${calls[0].method} ×${calls.length}); penalty ${((p.cooldownUntil - Date.now()) / 1000) | 0}s`);
         continue;
       }
+      p.strikes = 0;
       p.minInterval = Math.max(150, p.minInterval * 0.93);
       const out = new Array(calls.length);
       for (const r of arr) out[r.id] = r;
@@ -120,7 +135,8 @@ async function rpcBatch(calls) {
       if (out.some((r) => r.error) && attempt < 3 && ENDPOINTS.length > 1) { p.cooldownUntil = Date.now() + 2000; continue; }
       return out;
     } catch (e) {
-      p.cooldownUntil = Date.now() + Math.min(20_000, 2000 * (attempt + 1));
+      p.strikes++;
+      p.cooldownUntil = Date.now() + Math.min(600_000, 2000 * 2 ** Math.min(p.strikes, 8));
       if (attempt === MAX_ATTEMPTS - 1) throw e;
     }
   }
@@ -195,7 +211,18 @@ const statePath = path.join(DATA_DIR, "state.json");
 let state = readJson(statePath, null);
 const labels = readJson(path.join(__dirname, "labels.json"), {});
 
-async function initState() {
+function newCursor(name, from, endBlock, nCons) {
+  const zeros = () => Array.from({ length: nCons }, () => 0);
+  return {
+    name, from, lastBlock: from - 1, endBlock, // endBlock null = follow the tip
+    model: { backlogs: zeros(), without: Object.fromEntries(CKEYS.map((n) => [n, zeros()])), lastTs: null, warmAt: null },
+    prevHeader: null,
+    rounds: Object.fromEntries(NAMES.map((n) => [n, []])), // per contract: [{ n, startBlock, startTs, firstId, maxId, startKnown, endBlock?, endTs? }]
+    lastMaxTradeId: Object.fromEntries(NAMES.map((n) => [n, 0])),
+    fit: null,
+  };
+}
+async function chainTipAndRate() {
   const latest = toInt(await rpc("eth_blockNumber", []));
   const tip = latest - CONFIRMATIONS;
   const probe = 100_000;
@@ -203,29 +230,38 @@ async function initState() {
     { method: "eth_getBlockByNumber", params: [hex(tip - probe), false] },
     { method: "eth_getBlockByNumber", params: [hex(tip), false] },
   ]);
-  const rate = probe / (toInt(b.result.timestamp) - toInt(a.result.timestamp)); // blocks per second
-  const start = Math.max(1, tip - Math.round(rate * 86400 * BACKFILL_DAYS));
+  return { tip, rate: probe / (toInt(b.result.timestamp) - toInt(a.result.timestamp)) }; // blocks per second
+}
+async function initState() {
+  const { tip, rate } = await chainTipAndRate();
   const { minBaseFee, constraints } = await readChainParams();
   const chainId = toInt(await rpc("eth_chainId", []));
-  const zeros = () => constraints.map(() => 0);
+  const liveFrom = Math.max(1, tip - Math.round(rate * 3600 * LIVE_HOURS));
+  const backFrom = Math.max(1, tip - Math.round(rate * 86400 * BACKFILL_DAYS));
   return {
+    version: 2,
     chainId,
     tracked: TRACKED,
-    startBlock: start,
-    lastBlock: start - 1,
     minBaseFee,
     constraints: constraints.map(({ target, window }) => ({ target, window })),
-    model: {
-      backlogs: zeros(),
-      without: Object.fromEntries([...NAMES, "all"].map((n) => [n, zeros()])), // counterfactual backlogs
-      lastTs: null, warmAt: null,
-    },
-    prevHeader: null,
-    rounds: Object.fromEntries(NAMES.map((n) => [n, []])), // per contract: [{ n, startBlock, startTs, firstId, maxId, startKnown, endBlock?, endTs? }]
-    lastMaxTradeId: Object.fromEntries(NAMES.map((n) => [n, 0])),
     sampleEvery: SAMPLE_EVERY,
-    fit: null,
     eventStats: { tradeSettledByShape: 0, failedByShape: 0, other: 0 },
+    cursors: {
+      live: newCursor("live", liveFrom, null, constraints.length),
+      backfill: backFrom < liveFrom ? newCursor("backfill", backFrom, liveFrom - 1, constraints.length) : null,
+    },
+  };
+}
+/** v1 state (single forward cursor) → v2: the old cursor becomes the backfill, a fresh live cursor starts near the tip. */
+async function migrateV1(old) {
+  const { tip, rate } = await chainTipAndRate();
+  const liveFrom = Math.max(old.lastBlock + 1, tip - Math.round(rate * 3600 * LIVE_HOURS));
+  const backfill = { name: "backfill", from: old.startBlock, lastBlock: old.lastBlock, endBlock: liveFrom - 1, model: old.model, prevHeader: old.prevHeader, rounds: old.rounds, lastMaxTradeId: old.lastMaxTradeId, fit: old.fit };
+  log(`migrating v1 state: backfill ${old.startBlock}-${liveFrom - 1} (at ${old.lastBlock}), live from ${liveFrom}`);
+  return {
+    version: 2, chainId: old.chainId, tracked: old.tracked, minBaseFee: old.minBaseFee, constraints: old.constraints, sampleEvery: old.sampleEvery,
+    eventStats: old.eventStats || { tradeSettledByShape: 0, failedByShape: 0, other: 0 },
+    cursors: { live: newCursor("live", liveFrom, null, old.constraints.length), backfill: backfill.lastBlock >= backfill.endBlock ? null : backfill },
   };
 }
 
@@ -240,10 +276,9 @@ function dayFile(date) {
   }
   return dayCache.get(date);
 }
-function flushDays() {
-  for (const [date, d] of dayCache) writeJson(path.join(DATA_DIR, "days", `${date}.json`), d);
+function checkpointDays() {
+  for (const [date, d] of dayCache) writeJson(path.join(DATA_DIR, "days", `${date}.json`), { ...d, rows: Object.fromEntries(Object.entries(d.rows).map(([k, r]) => [k, "baseFeeAvg" in r ? r : finalizeRow(r)])) });
 }
-const CKEYS = [...NAMES, "all"];
 function newContractAcc() {
   return { txs: 0, gas: 0, l1Gas: 0, trades: 0, failed: 0, feeEth: 0, premiumEth: 0, selfPremiumEth: 0, causedEth: 0, qNoSum: 0 };
 }
@@ -283,7 +318,7 @@ function finalizeRow(r) {
 }
 
 // ───────────────────────────── chunk processing ─────────────────────────────
-async function processChunk(from, to) {
+async function processChunk(cur, from, to) {
   // 1. headers for every block
   const headers = new Array(to - from + 1);
   const hcalls = [];
@@ -361,7 +396,7 @@ async function processChunk(from, to) {
   });
 
   // 4. walk blocks in order: model, rounds, minute rows
-  const m = state.model;
+  const m = cur.model;
   const cons = state.constraints;
   const fitErr = [];
   for (const h of headers) {
@@ -410,17 +445,17 @@ async function processChunk(from, to) {
     for (const t of ours) for (const id of t.ids) {
       const k = t.who;
       const idN = id > 2n ** 53n ? Number.MAX_SAFE_INTEGER : Number(id);
-      const rs = state.rounds[k];
+      const rs = cur.rounds[k];
       if (rs.length === 0) rs.push({ n: 1, startBlock: h.n, startTs: h.ts, firstId: idN, maxId: idN, startKnown: false });
-      else if (state.lastMaxTradeId[k] > 5000 && idN < state.lastMaxTradeId[k] / 4) {
+      else if (cur.lastMaxTradeId[k] > 5000 && idN < cur.lastMaxTradeId[k] / 4) {
         const prev = rs[rs.length - 1];
         prev.endBlock = h.n - 1; prev.endTs = h.ts;
         rs.push({ n: prev.n + 1, startBlock: h.n, startTs: h.ts, firstId: idN, maxId: idN, startKnown: true });
-        state.lastMaxTradeId[k] = 0;
+        cur.lastMaxTradeId[k] = 0;
       }
-      const cur = rs[rs.length - 1];
-      if (idN > cur.maxId) cur.maxId = idN;
-      if (idN > state.lastMaxTradeId[k]) state.lastMaxTradeId[k] = idN;
+      const r = rs[rs.length - 1];
+      if (idN > r.maxId) r.maxId = idN;
+      if (idN > cur.lastMaxTradeId[k]) cur.lastMaxTradeId[k] = idN;
     }
 
     // minute row
@@ -470,14 +505,53 @@ async function processChunk(from, to) {
   }
   if (fitErr.length > 50) {
     fitErr.sort((a, b) => a - b);
-    state.fit = { blocks: fitErr.length, medianAbsErr: fitErr[Math.floor(fitErr.length / 2)], p90AbsErr: fitErr[Math.floor(fitErr.length * 0.9)], asOfBlock: to };
+    cur.fit = { blocks: fitErr.length, medianAbsErr: fitErr[Math.floor(fitErr.length / 2)], p90AbsErr: fitErr[Math.floor(fitErr.length * 0.9)], asOfBlock: to };
   }
-  state.lastBlock = to;
-  state.prevHeader = { n: to, ts: headers[headers.length - 1].ts };
+  cur.lastBlock = to;
+  cur.prevHeader = { n: to, ts: headers[headers.length - 1].ts };
   return { txs: txs.size, logs: logs.length, sampled: sampleBlocks.length };
 }
 
+/** Walk one cursor forward until `until` (inclusive) or the time budget runs out. */
+async function runCursor(cur, until) {
+  let from = cur.lastBlock + 1, chunks = 0;
+  while (from <= until) {
+    if (budgetLeft() <= 0) { log(`[${cur.name}] time budget reached at ${cur.lastBlock}; will resume next run`); break; }
+    const to = Math.min(until, from + CHUNK - 1);
+    const t1 = Date.now();
+    const info = await processChunk(cur, from, to);
+    checkpointDays();
+    writeJson(statePath, state);
+    chunks++;
+    log(`[${cur.name}] blocks ${from}-${to} (${to - from + 1}) trackedTxs=${info.txs} logs=${info.logs} sampled=${info.sampled} in ${((Date.now() - t1) / 1000).toFixed(1)}s`);
+    from = to + 1;
+  }
+  return chunks;
+}
+
 // ───────────────────────────── index / summary ─────────────────────────────
+/** Rounds as the page sees them: backfill rounds first, then live, joined at the seam. */
+function mergedRounds() {
+  const { live, backfill } = state.cursors;
+  const out = {};
+  for (const k of NAMES) {
+    const bf = backfill ? backfill.rounds[k].map((r) => ({ ...r })) : [];
+    const lv = live.rounds[k].map((r) => ({ ...r }));
+    const seamClosed = !backfill || backfill.lastBlock >= backfill.endBlock;
+    if (seamClosed && bf.length && lv.length) {
+      const last = bf[bf.length - 1], first = lv[0];
+      if (!first.startKnown && first.firstId >= last.maxId / 4) {
+        // same round continues across the seam
+        last.maxId = Math.max(last.maxId, first.maxId);
+        if (first.endTs) { last.endTs = first.endTs; last.endBlock = first.endBlock; }
+        lv.shift();
+      } else if (!first.startKnown) first.startKnown = false;
+    }
+    let n = 0;
+    out[k] = [...bf, ...lv].map((r) => ({ ...r, n: ++n }));
+  }
+  return out;
+}
 function writeIndex() {
   const daysDir = path.join(DATA_DIR, "days");
   const days = fs.existsSync(daysDir) ? fs.readdirSync(daysDir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)).sort() : [];
@@ -491,20 +565,24 @@ function writeIndex() {
     }
     return s;
   });
+  const { live, backfill } = state.cursors;
   writeJson(path.join(DATA_DIR, "index.json"), {
     updatedAt: Math.floor(Date.now() / 1000),
     chainId: state.chainId,
     tracked: state.tracked,
-    startBlock: state.startBlock,
-    lastBlock: state.lastBlock,
-    lastBlockTs: state.prevHeader?.ts ?? null,
+    startBlock: backfill ? backfill.from : live.from,
+    lastBlock: live.lastBlock,
+    lastBlockTs: live.prevHeader?.ts ?? null,
+    liveFrom: live.from,
+    liveFromTs: live.model.warmAt === null ? null : live.model.warmAt - Math.max(...state.constraints.map((c) => c.window)),
+    backfill: backfill ? { from: backfill.from, lastBlock: backfill.lastBlock, endBlock: backfill.endBlock, done: backfill.lastBlock >= backfill.endBlock, lastTs: backfill.prevHeader?.ts ?? null } : null,
     minBaseFee: state.minBaseFee,
     constraints: state.constraints,
     sampleEvery: state.sampleEvery,
-    modelWarmAt: state.model.warmAt,
-    fit: state.fit,
+    modelWarmAt: live.model.warmAt,
+    fit: live.fit,
     eventStats: state.eventStats,
-    rounds: state.rounds,
+    rounds: mergedRounds(),
     labels,
     days: summaries,
   });
@@ -512,37 +590,26 @@ function writeIndex() {
 
 // ───────────────────────────── main ─────────────────────────────
 (async () => {
-  if (!state) { state = await initState(); log(`fresh state: chain ${state.chainId}, tracking ${NAMES.join("+")}, scanning from block ${state.startBlock} (${BACKFILL_DAYS}d backfill)`); }
+  if (!state) { state = await initState(); log(`fresh state: chain ${state.chainId}, tracking ${NAMES.join("+")}, live from ${state.cursors.live.from} (${LIVE_HOURS}h), backfill ${state.cursors.backfill ? `${state.cursors.backfill.from}-${state.cursors.backfill.endBlock} (${BACKFILL_DAYS}d)` : "off"}`); }
   else {
     const same = state.tracked && state.tracked.length === TRACKED.length && state.tracked.every((t, i) => t.addr === TRACKED[i].addr && t.name === TRACKED[i].name);
     if (!same) throw new Error(`TRACKED changed since data/state.json was created (${JSON.stringify(state.tracked)}) — delete data/ to restart`);
+    if (!state.cursors) state = await migrateV1(state);
     // refresh the chain params each run (an ArbOwner change to the schedule would silently skew the model)
     const { minBaseFee, constraints } = await readChainParams();
     if (constraints.length === state.constraints.length) state.constraints = constraints.map(({ target, window }) => ({ target, window }));
     state.minBaseFee = minBaseFee;
     state.eventStats ||= { tradeSettledByShape: 0, failedByShape: 0, other: 0 };
   }
-  const latest = toInt(await rpc("eth_blockNumber", []));
-  const tip = latest - CONFIRMATIONS;
-  log(`state lastBlock=${state.lastBlock} tip=${tip} behind=${tip - state.lastBlock} blocks; endpoints=${ENDPOINTS.map((e) => new URL(e).host).join(",")}`);
-  let from = state.lastBlock + 1;
-  let chunks = 0;
-  while (from <= tip) {
-    if (Date.now() - t0 > MAX_RUN_MS) { log("time budget reached; will resume next run"); break; }
-    const to = Math.min(tip, from + CHUNK - 1);
-    const t1 = Date.now();
-    const info = await processChunk(from, to);
-    // checkpoint: finalized rows on disk, accumulator rows in memory
-    for (const [date, d] of dayCache) writeJson(path.join(DATA_DIR, "days", `${date}.json`), { ...d, rows: Object.fromEntries(Object.entries(d.rows).map(([k, r]) => [k, "baseFeeAvg" in r ? r : finalizeRow(r)])) });
-    writeJson(statePath, state);
-    chunks++;
-    log(`blocks ${from}-${to} (${to - from + 1}) trackedTxs=${info.txs} logs=${info.logs} sampled=${info.sampled} in ${((Date.now() - t1) / 1000).toFixed(1)}s`);
-    from = to + 1;
-  }
+  const { tip } = await chainTipAndRate();
+  const { live, backfill } = state.cursors;
+  log(`live lastBlock=${live.lastBlock} tip=${tip} behind=${tip - live.lastBlock}; backfill ${backfill ? `${backfill.lastBlock}/${backfill.endBlock} (${backfill.endBlock - backfill.lastBlock} left)` : "done"}; endpoints=${ENDPOINTS.map((e) => new URL(e).host).join(",")}`);
+  let chunks = await runCursor(live, tip);
+  if (backfill && backfill.lastBlock < backfill.endBlock && budgetLeft() > 0) chunks += await runCursor(backfill, backfill.endBlock);
   for (const d of dayCache.values()) for (const k of Object.keys(d.rows)) if ("baseFeeSum" in d.rows[k]) d.rows[k] = finalizeRow(d.rows[k]);
-  flushDays();
+  for (const [date, d] of dayCache) writeJson(path.join(DATA_DIR, "days", `${date}.json`), d);
   writeIndex();
-  const roundsSummary = NAMES.map((n) => `${n}:${state.rounds[n].length}`).join(" ");
+  const roundsSummary = NAMES.map((n) => `${n}:${mergedRounds()[n].length}`).join(" ");
   log(`throttle events this run: ${throttleEvents}`);
-  log(`done: ${chunks} chunks, lastBlock=${state.lastBlock}, rounds ${roundsSummary}, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  log(`done: ${chunks} chunks, live=${live.lastBlock}, backfill=${backfill ? `${backfill.lastBlock}/${backfill.endBlock}` : "done"}, rounds ${roundsSummary}, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 })().catch((e) => { console.error(e); process.exit(1); });

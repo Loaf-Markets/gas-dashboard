@@ -19,7 +19,7 @@ collect.mjs  ──(hourly cron)──▶ data/days/YYYY-MM-DD.json + data/index
 |---|---|
 | Team Grafana is IP-allowlisted | Static site on GitHub Pages; anyone with the link can open it |
 | `Loaf-Markets/Smart-Contracts` is **private on a free org plan** — GitHub Pages is not available for private repos on Free; and every merge to its `main` images and rolls the bridge fleets | This is its own repo (public, so Pages works); it contains only public chain data and this code, and never touches the bridge deploy path |
-| Public RPCs throttle at ~1 batch/s per IP | Collector is incremental + checkpointed, uses cheap batched calls and per-endpoint adaptive pacing; each hourly run is ~10–20 min, backfill catches up over a few runs |
+| Public RPCs throttle at ~1 batch/s per IP (a GitHub runner scans ~11–20 blocks/s across four endpoints) | Collector is incremental + checkpointed, uses batched calls with per-endpoint adaptive pacing, and runs two cursors: a **live** cursor that follows the tip (processed first, so the page is current after the first run) and a **backfill** cursor that fills older history behind it |
 | No archive node (historical `eth_call` fails) | ArbOS pricing model is anchored to the *measured* base fee, so cold-start error cancels out of the counterfactual |
 | Ranking "everyone else" needs every receipt on the chain (~350k blocks/day) | Full receipts for 1-in-200 blocks, scaled — clearly labelled as sampled. Our own numbers are exact |
 
@@ -45,8 +45,12 @@ The site appears at `https://loaf-markets.github.io/gas-dashboard/` after the fi
 successful run (~2 min for the deploy step; the collector step runs up to 45 min
 per hour until the backfill catches up).
 
-Optional speed-up: add a repo secret `RPC_URLS` with a comma-separated list that
-includes a keyed provider (Alchemy / QuickNode / …). The collector round-robins
+Measured alternatives that did NOT help: the Etherscan V2 `txlist` API (63 s per
+1,000 transactions on this chain, capped at 1,000 rows — slower than batched RPC
+receipts), and larger RPC batches (every public endpoint returns 429 above ~100
+items). Optional speed-up: add a repo secret `RPC_URLS` with a comma-separated list that
+includes a keyed provider (Alchemy / QuickNode / …). Do not reuse the bridge's
+production Alchemy key — the dashboard would eat the bridge's quota. The collector round-robins
 across every endpoint listed, so keyed + public together is fastest. Never put a
 keyed URL in the workflow file or this README (P0 Rule 6).
 
@@ -117,7 +121,9 @@ share would add on top and is not affected by congestion or by deferring batches
 
 ## Data layout
 
-- `data/state.json` — scan cursor, model backlogs, round detector state. Delete to restart.
+- `data/state.json` — the two cursors (`live`, `backfill`), each with its scan position,
+  model backlogs and round-detector state. Delete to restart. A v1 single-cursor state is
+  migrated automatically (it becomes the backfill; a fresh live cursor starts near the tip).
 - `data/days/YYYY-MM-DD.json` — `rows` keyed by minute epoch: chain-wide fields plus
   `c.<name>` / `c.all` per-contract blocks (txs, gas, trades, ETH, premiums, counterfactual);
   `topHours` keyed by hour epoch: sampled per-address `[gas, txs]` (top 120 + `_other`).
@@ -137,3 +143,8 @@ loads the days in the selected range.
   header turns red past 3 h.
 - Timestamps are block timestamps (UTC). Minutes with no block on the chain are
   shown as zero.
+- While the backfill is still running there is a gap between the oldest backfilled
+  minute and the live cursor's start; the header says how far along it is. Buckets
+  inside the gap show as zero until it closes.
+- The live cursor's pricing-model replay starts cold, so "elevation we cause" is
+  understated for the first 24 h of the live segment even after the backfill lands.

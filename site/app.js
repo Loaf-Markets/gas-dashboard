@@ -253,7 +253,9 @@
       `chain ${m.chainId}`,
       `<span class="${stale ? "stale" : ""}">updated ${fmtDur(age)} ago${stale ? " (stale)" : ""}</span>`,
       `data through block ${fmtNum(m.lastBlock)} (${fmtDur(lag)} behind now)`,
-      `history since ${fmtDateTime(Math.min(...m.days.map((d) => d.firstT)))}`,
+      m.backfill && !m.backfill.done
+        ? `history filling in: ${fmtPct((m.backfill.lastBlock - m.backfill.from) / Math.max(1, m.backfill.endBlock - m.backfill.from), 0)} of the ${fmtDur((m.liveFromTs || m.lastBlockTs) - (m.days.length ? Math.min(...m.days.map((d) => d.firstT)) : m.lastBlockTs))} before ${fmtDateTime(m.liveFromTs || m.lastBlockTs)} (there is a gap until it catches up)`
+        : `history since ${fmtDateTime(Math.min(...m.days.map((d) => d.firstT)))}`,
       m.fit ? `replay fit ±${fmtPct(m.fit.medianAbsErr, 1)}` : `model replay warming up`,
       m.eventStats && (m.eventStats.tradeSettledByShape || m.eventStats.failedByShape) ? `<span class="stale">event signature changed on chain: ${fmtNum(m.eventStats.tradeSettledByShape + m.eventStats.failedByShape)} events matched by shape — check labels.json / collector</span>` : "",
     ].filter(Boolean).join(" · ");
