@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="description" content="How much of Arbitrum Sepolia the Loaf settlement contracts use, what it costs, and why the base fee is where it is.">
 <title>Settlement Gas — Arbitrum Sepolia</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛽</text></svg>">
 <style>
@@ -182,7 +184,7 @@
       <div class="card wide">
         <h2>Base fee elevation — measured, and what it would be without our load</h2>
         <div class="sub">Base fee as a multiple of the chain minimum. The dashed line is the measured fee with our gas removed from every block, using Arbitrum's own six-constraint pricing model; the gap between it and the measured line is the elevation we cause. The thin "replay" line is the same model run cold on all gas, so you can judge how well it tracks reality.</div>
-        <div class="legend"><span><i style="background:var(--s2)"></i>Measured base fee</span><span><i style="background:var(--ours)"></i>Model replay (all gas)</span><span><i style="background:var(--s3)"></i><span id="lg-fee-nous">Without Loaf gas</span></span></div>
+        <div class="legend"><span><i style="background:var(--s2)"></i>Measured base fee (band = low–high within the bucket)</span><span><i style="background:var(--s3)"></i><span id="lg-fee-nous">Without Loaf gas</span></span><span><i style="background:var(--ours);opacity:.5"></i>shaded gap = elevation we cause</span><span><i style="background:var(--ours);height:2px"></i>Model replay (all gas, diagnostic)</span></div>
         <div class="chart" id="c-fee"></div>
         <div class="note" id="fee-note"></div>
       </div>
@@ -192,6 +194,23 @@
         <div class="sub">ETH paid per bucket by our relayers, split into the floor price, the elevation premium caused by other traffic, and the premium caused by our own load.</div>
         <div class="legend"><span><i style="background:var(--ours)"></i>At minimum base fee</span><span><i style="background:var(--s4)"></i>Premium from others' load</span><span><i style="background:var(--s2)"></i>Premium from our own load</span></div>
         <div class="chart" id="c-cost"></div>
+      </div>
+
+      <div class="card">
+        <h2>Gas per trade</h2>
+        <div class="sub">Work per settled trade. The dashed line is the measured marginal cost of one more trade in a batch (126k gas): the gap above it is fixed per-batch overhead that better batching can remove.</div>
+        <div class="chart" id="c-gpt"></div>
+      </div>
+      <div class="card">
+        <h2>Trades per batch</h2>
+        <div class="sub">How many trades share one on-chain transaction. Higher is cheaper per trade; the bridge's batch window and consumer count are the levers.</div>
+        <div class="chart" id="c-tpb"></div>
+      </div>
+
+      <div class="card wide">
+        <h2>Spend so far in the range</h2>
+        <div class="sub">Running total of ETH paid, against what the same work would have cost at the floor price. The vertical distance is the congestion bill.</div>
+        <div class="chart" id="c-cum"></div>
       </div>
 
       <div class="card wide">
@@ -232,7 +251,7 @@
     </details>
   </div>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
 <script src="app.js"></script>
 </body>
 </html>

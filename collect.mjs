@@ -147,15 +147,20 @@ async function rpc(method, params) {
   if (r.error) throw new Error(`${method}: ${r.error.message}`);
   return r.result;
 }
-/** Run batches with bounded concurrency. */
+/** Run batches with bounded concurrency. A batch that comes back with per-item errors
+ *  (e.g. "response too large" from a size-capped provider) is split in half and retried;
+ *  only a single-item batch that still errors is fatal. */
 async function runBatches(calls, size, worker) {
-  const groups = [];
-  for (let i = 0; i < calls.length; i += size) groups.push(calls.slice(i, i + size));
-  let next = 0;
+  const queue = [];
+  for (let i = 0; i < calls.length; i += size) queue.push(calls.slice(i, i + size));
   const lanes = Array.from({ length: Math.max(1, CONCURRENCY * ENDPOINTS.length) }, async () => {
-    while (next < groups.length) {
-      const g = groups[next++];
+    while (queue.length) {
+      const g = queue.shift();
       const res = await rpcBatch(g);
+      if (res.some((r) => r.error || !r.result)) {
+        if (g.length > 1) { const mid = Math.ceil(g.length / 2); queue.push(g.slice(0, mid), g.slice(mid)); log(`  batch of ${g.length} ${g[0].method} had item errors (${res.find((r) => r.error)?.error?.message || "null result"}); splitting`); continue; }
+        // let the worker raise a precise error for the single failing item
+      }
       worker(g, res);
     }
   });
@@ -176,10 +181,26 @@ function writeJson(p, obj) {
   fs.renameSync(tmp, p);
 }
 
+/** Round detector: a new round opens when an id falls below a quarter of the running
+ *  maximum, after at least 5,000 ids (ids are not strictly monotone inside a round). */
+export function observeTradeId(cur, k, idN, h) {
+  const rs = cur.rounds[k];
+  if (rs.length === 0) rs.push({ n: 1, startBlock: h.n, startTs: h.ts, firstId: idN, maxId: idN, startKnown: false });
+  else if (cur.lastMaxTradeId[k] > 5000 && idN < cur.lastMaxTradeId[k] / 4) {
+    const prev = rs[rs.length - 1];
+    prev.endBlock = h.n - 1; prev.endTs = h.ts;
+    rs.push({ n: prev.n + 1, startBlock: h.n, startTs: h.ts, firstId: idN, maxId: idN, startKnown: true });
+    cur.lastMaxTradeId[k] = 0;
+  }
+  const r = rs[rs.length - 1];
+  if (idN > r.maxId) r.maxId = idN;
+  if (idN > cur.lastMaxTradeId[k]) cur.lastMaxTradeId[k] = idN;
+}
+
 /** ArbOS-51 quartic: Q(E) ≈ 1 + E + E²/2 + E³/6 + E⁴/24 (arbmath.ApproxExpBasisPoints(E, 4)). */
-const quartic = (E) => 1 + E + (E * E) / 2 + (E * E * E) / 6 + (E * E * E * E) / 24;
+export const quartic = (E) => 1 + E + (E * E) / 2 + (E * E * E) / 6 + (E * E * E * E) / 24;
 /** Inverse of the quartic on E >= 0 (monotone), by Newton iteration. */
-function invQuartic(q) {
+export function invQuartic(q) {
   if (q <= 1) return 0;
   let E = Math.log(q);
   for (let i = 0; i < 30; i++) {
@@ -208,7 +229,8 @@ async function readChainParams() {
 
 // ───────────────────────────── state ─────────────────────────────
 const statePath = path.join(DATA_DIR, "state.json");
-let state = readJson(statePath, null);
+let state = isMainCheck() ? readJson(statePath, null) : null;
+function isMainCheck() { return process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url); }
 const labels = readJson(path.join(__dirname, "labels.json"), {});
 
 function newCursor(name, from, endBlock, nCons) {
@@ -290,7 +312,7 @@ function newRow(t) {
   };
 }
 /** Day files persist finalized rows; a later run that touches the same minute needs the accumulator shape back. */
-function toAccum(r) {
+export function toAccum(r) {
   if (!("baseFeeAvg" in r)) return r;
   const b = r.blocks || 1;
   const c = {};
@@ -303,7 +325,7 @@ function toAccum(r) {
     baseFeeSum: r.baseFeeAvg * b, baseFeeMax: r.baseFeeMax, baseFeeMin: r.baseFeeMin, qActSum: r.qAct * b, qModelSum: (r.qModel ?? r.qAct) * b, qMax: r.qMax, c,
   };
 }
-function finalizeRow(r) {
+export function finalizeRow(r) {
   const b = r.blocks || 1;
   const c = {};
   for (const k of CKEYS) {
@@ -442,21 +464,7 @@ async function processChunk(cur, from, to) {
     for (const k of CKEYS) { qNo[k] = quartic(Math.max(0, Emeas - (E - Eno[k]))); uplift[k] = Math.max(0, 1 - qNo[k] / qMeas); }
 
     // rounds: raw uint64 trade ids restart near 1 on a competition round reset (per contract)
-    for (const t of ours) for (const id of t.ids) {
-      const k = t.who;
-      const idN = id > 2n ** 53n ? Number.MAX_SAFE_INTEGER : Number(id);
-      const rs = cur.rounds[k];
-      if (rs.length === 0) rs.push({ n: 1, startBlock: h.n, startTs: h.ts, firstId: idN, maxId: idN, startKnown: false });
-      else if (cur.lastMaxTradeId[k] > 5000 && idN < cur.lastMaxTradeId[k] / 4) {
-        const prev = rs[rs.length - 1];
-        prev.endBlock = h.n - 1; prev.endTs = h.ts;
-        rs.push({ n: prev.n + 1, startBlock: h.n, startTs: h.ts, firstId: idN, maxId: idN, startKnown: true });
-        cur.lastMaxTradeId[k] = 0;
-      }
-      const r = rs[rs.length - 1];
-      if (idN > r.maxId) r.maxId = idN;
-      if (idN > cur.lastMaxTradeId[k]) cur.lastMaxTradeId[k] = idN;
-    }
+    for (const t of ours) for (const id of t.ids) observeTradeId(cur, t.who, id > 2n ** 53n ? Number.MAX_SAFE_INTEGER : Number(id), h);
 
     // minute row
     const minute = Math.floor(h.ts / 60) * 60;
@@ -519,7 +527,18 @@ async function runCursor(cur, until) {
     if (budgetLeft() <= 0) { log(`[${cur.name}] time budget reached at ${cur.lastBlock}; will resume next run`); break; }
     const to = Math.min(until, from + CHUNK - 1);
     const t1 = Date.now();
-    const info = await processChunk(cur, from, to);
+    let info;
+    try { info = await processChunk(cur, from, to); }
+    catch (e) {
+      // Do not take the whole run (and the deploy) down with one bad chunk: keep the last
+      // checkpoint, record the error for the page, stop this cursor for now.
+      state.lastError = { at: Math.floor(Date.now() / 1000), cursor: cur.name, from, to, message: String(e.message || e).slice(0, 300) };
+      log(`[${cur.name}] chunk ${from}-${to} FAILED: ${state.lastError.message} — stopping this cursor for this run`);
+      // in-memory day rows may hold partial minutes from the failed chunk: reload from disk
+      dayCache.clear();
+      return chunks;
+    }
+    state.lastError = null;
     checkpointDays();
     writeJson(statePath, state);
     chunks++;
@@ -530,27 +549,26 @@ async function runCursor(cur, until) {
 }
 
 // ───────────────────────────── index / summary ─────────────────────────────
+/** Join one contract's backfill and live round lists at the seam (pure). */
+export function mergeRoundLists(bfRounds, lvRounds, seamClosed) {
+  const bf = bfRounds.map((r) => ({ ...r })), lv = lvRounds.map((r) => ({ ...r }));
+  if (seamClosed && bf.length && lv.length) {
+    const last = bf[bf.length - 1], first = lv[0];
+    if (!first.startKnown && first.firstId >= last.maxId / 4) {
+      // same round continues across the seam
+      last.maxId = Math.max(last.maxId, first.maxId);
+      if (first.endTs) { last.endTs = first.endTs; last.endBlock = first.endBlock; }
+      lv.shift();
+    }
+  }
+  let n = 0;
+  return [...bf, ...lv].map((r) => ({ ...r, n: ++n }));
+}
 /** Rounds as the page sees them: backfill rounds first, then live, joined at the seam. */
 function mergedRounds() {
   const { live, backfill } = state.cursors;
-  const out = {};
-  for (const k of NAMES) {
-    const bf = backfill ? backfill.rounds[k].map((r) => ({ ...r })) : [];
-    const lv = live.rounds[k].map((r) => ({ ...r }));
-    const seamClosed = !backfill || backfill.lastBlock >= backfill.endBlock;
-    if (seamClosed && bf.length && lv.length) {
-      const last = bf[bf.length - 1], first = lv[0];
-      if (!first.startKnown && first.firstId >= last.maxId / 4) {
-        // same round continues across the seam
-        last.maxId = Math.max(last.maxId, first.maxId);
-        if (first.endTs) { last.endTs = first.endTs; last.endBlock = first.endBlock; }
-        lv.shift();
-      } else if (!first.startKnown) first.startKnown = false;
-    }
-    let n = 0;
-    out[k] = [...bf, ...lv].map((r) => ({ ...r, n: ++n }));
-  }
-  return out;
+  const seamClosed = !backfill || backfill.lastBlock >= backfill.endBlock;
+  return Object.fromEntries(NAMES.map((k) => [k, mergeRoundLists(backfill ? backfill.rounds[k] : [], live.rounds[k], seamClosed)]));
 }
 function writeIndex() {
   const daysDir = path.join(DATA_DIR, "days");
@@ -582,6 +600,7 @@ function writeIndex() {
     modelWarmAt: live.model.warmAt,
     fit: live.fit,
     eventStats: state.eventStats,
+    lastError: state.lastError || null,
     rounds: mergedRounds(),
     labels,
     days: summaries,
@@ -589,7 +608,8 @@ function writeIndex() {
 }
 
 // ───────────────────────────── main ─────────────────────────────
-(async () => {
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) (async () => {
   if (!state) { state = await initState(); log(`fresh state: chain ${state.chainId}, tracking ${NAMES.join("+")}, live from ${state.cursors.live.from} (${LIVE_HOURS}h), backfill ${state.cursors.backfill ? `${state.cursors.backfill.from}-${state.cursors.backfill.endBlock} (${BACKFILL_DAYS}d)` : "off"}`); }
   else {
     const same = state.tracked && state.tracked.length === TRACKED.length && state.tracked.every((t, i) => t.addr === TRACKED[i].addr && t.name === TRACKED[i].name);

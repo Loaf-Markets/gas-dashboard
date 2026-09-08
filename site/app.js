@@ -126,6 +126,7 @@
     state.charts[id] = new Chart(host.firstChild, cfg);
   }
   const useBars = (n) => n <= 400;
+  const cov = (b, v) => (b.blocks > 0 ? v : null); // uncovered bucket → gap, never a fake zero
   const bucketLabels = (buckets, gran) => buckets.map((b) => gran === "round" ? "Round " + b.key.slice(6) : fmtTs(b.t, gran));
 
   function renderGas(buckets, gran) {
@@ -133,8 +134,8 @@
     mount("#c-gas", {
       type: bars ? "bar" : "line",
       data: { labels, datasets: [
-        { label: focusName(), data: buckets.map((b) => b.ourGas), backgroundColor: bars ? th.ours : th.oursSoft, borderColor: th.ours, fill: bars ? undefined : "origin", borderRadius: 2, borderSkipped: false, fmt: fmtGas },
-        { label: "Rest of chain", data: buckets.map((b) => Math.max(0, b.chainGas - b.ourGas)), backgroundColor: bars ? th.rest : th.restSoft, borderColor: th.rest, fill: bars ? undefined : "-1", borderRadius: 2, borderSkipped: false, fmt: fmtGas },
+        { label: focusName(), data: buckets.map((b) => cov(b, b.ourGas)), backgroundColor: bars ? th.ours : th.oursSoft, borderColor: th.ours, fill: bars ? undefined : "origin", borderRadius: 2, borderSkipped: false, fmt: fmtGas },
+        { label: "Rest of chain", data: buckets.map((b) => cov(b, Math.max(0, b.chainGas - b.ourGas))), backgroundColor: bars ? th.rest : th.restSoft, borderColor: th.rest, fill: bars ? undefined : "-1", borderRadius: 2, borderSkipped: false, fmt: fmtGas },
       ] },
       options: baseOpts(fmtGasAxis, { stacked: true }),
     });
@@ -142,15 +143,15 @@
   }
   function renderShare(buckets, gran) {
     const th = theme(); const labels = bucketLabels(buckets, gran); const bars = useBars(buckets.length);
-    mount("#c-share", { type: bars ? "bar" : "line", data: { labels, datasets: [{ label: `${focusName()} share of chain gas`, data: buckets.map((b) => b.share * 100), backgroundColor: bars ? th.ours : th.oursSoft, borderColor: th.ours, fill: !bars, borderRadius: 2, borderSkipped: false, fmt: (v) => v.toFixed(1) + "%" }] }, options: baseOpts((v) => v + "%", { y: { suggestedMax: 30 } }) });
+    mount("#c-share", { type: bars ? "bar" : "line", data: { labels, datasets: [{ label: `${focusName()} share of chain gas`, data: buckets.map((b) => cov(b, b.share * 100)), backgroundColor: bars ? th.ours : th.oursSoft, borderColor: th.ours, fill: !bars, borderRadius: 2, borderSkipped: false, fmt: (v) => v.toFixed(1) + "%" }] }, options: baseOpts((v) => v + "%", { y: { suggestedMax: 30 } }) });
   }
   function renderRate(buckets, gran) {
     const th = theme(); const labels = bucketLabels(buckets, gran); const bars = useBars(buckets.length);
     const cons = state.meta.constraints || [];
     const floor = cons.length ? Math.min(...cons.map((c) => c.target)) : null;
     const ds = [
-      { label: `${focusName()} gas/s`, data: buckets.map((b) => b.ourRate), backgroundColor: bars ? th.ours : th.oursSoft, borderColor: th.ours, fill: !bars, borderRadius: 2, borderSkipped: false, fmt: (v) => fmtGas(v) + "/s" },
-      { label: "Whole chain gas/s", data: buckets.map((b) => b.chainRate), type: "line", borderColor: th.rest, backgroundColor: th.rest, fill: false, fmt: (v) => fmtGas(v) + "/s" },
+      { label: `${focusName()} gas/s`, data: buckets.map((b) => cov(b, b.ourRate)), backgroundColor: bars ? th.ours : th.oursSoft, borderColor: th.ours, fill: !bars, borderRadius: 2, borderSkipped: false, fmt: (v) => fmtGas(v) + "/s" },
+      { label: "Whole chain gas/s", data: buckets.map((b) => cov(b, b.chainRate)), type: "line", borderColor: th.rest, backgroundColor: th.rest, fill: false, fmt: (v) => fmtGas(v) + "/s" },
     ];
     if (floor) ds.push({ label: "Indefinite target", data: buckets.map(() => floor), type: "line", borderColor: th.s2, borderDash: [6, 4], borderWidth: 1.5, fill: false, fmt: (v) => fmtGas(v) + "/s" });
     mount("#c-rate", { type: bars ? "bar" : "line", data: { labels, datasets: ds }, options: baseOpts((v) => fmtGasAxis(v) + "/s") });
@@ -159,9 +160,11 @@
   function renderFee(buckets, gran) {
     const th = theme(); const labels = bucketLabels(buckets, gran); const min = state.meta.minBaseFee;
     mount("#c-fee", { type: "line", data: { labels, datasets: [
-      { label: "Measured base fee (× min)", data: buckets.map((b) => b.qAct), borderColor: th.s2, backgroundColor: th.s2, fill: false, fmt: (v) => v.toFixed(2) + "× (" + fmtGwei(v * min) + ")" },
-      { label: "Model replay, all gas (× min)", data: buckets.map((b) => b.qModel), borderColor: th.ours, backgroundColor: th.ours, fill: false, borderWidth: 1.5, fmt: (v) => v.toFixed(2) + "×" },
-      { label: `Without ${focusName()} gas (× min)`, data: buckets.map((b) => b.qNoUs), borderColor: th.s3, backgroundColor: th.s3, borderDash: [6, 4], fill: false, fmt: (v) => v.toFixed(2) + "×" },
+      { label: "Bucket high", data: buckets.map((b) => cov(b, b.baseFeeMax / min)), borderColor: "transparent", backgroundColor: th.s2 + "22", fill: "+1", pointRadius: 0, borderWidth: 0, fmt: (v) => v.toFixed(2) + "×" },
+      { label: "Bucket low", data: buckets.map((b) => cov(b, b.baseFeeMin / min)), borderColor: "transparent", backgroundColor: "transparent", fill: false, pointRadius: 0, borderWidth: 0, fmt: (v) => v.toFixed(2) + "×" },
+      { label: "Measured base fee (× min)", data: buckets.map((b) => cov(b, b.qAct)), borderColor: th.s2, backgroundColor: th.ours + "33", fill: "+1", fmt: (v) => v.toFixed(2) + "× (" + fmtGwei(v * min) + ")" },
+      { label: `Without ${focusName()} gas (× min)`, data: buckets.map((b) => cov(b, b.qNoUs)), borderColor: th.s3, backgroundColor: th.s3, borderDash: [6, 4], fill: false, fmt: (v) => v.toFixed(2) + "×" },
+      { label: "Model replay, all gas (× min)", data: buckets.map((b) => cov(b, b.qModel)), borderColor: th.ours, backgroundColor: th.ours, fill: false, borderWidth: 1, borderDash: [2, 3], fmt: (v) => v.toFixed(2) + "×" },
     ] }, options: baseOpts((v) => v + "×", { y: { beginAtZero: false, suggestedMin: 1 } }) });
     $("#lg-fee-nous").textContent = `Without ${focusName()} gas`;
     const warm = state.meta.modelWarmAt; const notes = [];
@@ -169,9 +172,31 @@
     if (state.meta.fit) notes.push(`Replay fit vs measured base fee (warmed blocks): median error ${fmtPct(state.meta.fit.medianAbsErr, 1)}, p90 ${fmtPct(state.meta.fit.p90AbsErr, 1)} over ${fmtNum(state.meta.fit.blocks)} blocks.`);
     $("#fee-note").textContent = notes.join(" ");
   }
+  // (c) efficiency: gas per trade and trades per batch — the two numbers the batching lever moves
+  function renderEfficiency(buckets, gran) {
+    const th = theme(); const labels = bucketLabels(buckets, gran);
+    mount("#c-gpt", { type: "line", data: { labels, datasets: [
+      { label: "Gas per trade", data: buckets.map((b) => cov(b, b.ourTrades ? b.ourGas / b.ourTrades : null)), borderColor: th.ours, backgroundColor: th.oursSoft, fill: true, fmt: fmtGas },
+      { label: "Marginal cost per trade (perfect batching)", data: buckets.map(() => 126244), borderColor: th.s2, borderDash: [6, 4], borderWidth: 1.5, fill: false, fmt: fmtGas },
+    ] }, options: baseOpts(fmtGasAxis, { y: { beginAtZero: false } }) });
+    mount("#c-tpb", { type: "line", data: { labels, datasets: [
+      { label: "Trades per batch", data: buckets.map((b) => cov(b, b.ourTxs ? b.ourTrades / b.ourTxs : null)), borderColor: th.s3, backgroundColor: th.s3 + "33", fill: true, fmt: (v) => v.toFixed(2) },
+    ] }, options: baseOpts((v) => v, { y: { beginAtZero: true } }) });
+  }
+  // (d) cumulative spend over the range
+  function renderCumulative(buckets, gran) {
+    const th = theme(); const labels = bucketLabels(buckets, gran);
+    let acc = 0, accFloor = 0;
+    const cum = [], cumFloor = [];
+    for (const b of buckets) { acc += b.ourFeeEth; accFloor += Math.max(0, b.ourFeeEth - b.ourPremiumEth); cum.push(cov(b, acc)); cumFloor.push(cov(b, accFloor)); }
+    mount("#c-cum", { type: "line", data: { labels, datasets: [
+      { label: "ETH spent so far", data: cum, borderColor: th.ours, backgroundColor: th.oursSoft, fill: true, fmt: fmtEth },
+      { label: "What it would have cost at the floor price", data: cumFloor, borderColor: th.s3, borderDash: [6, 4], fill: false, fmt: fmtEth },
+    ] }, options: baseOpts((v) => fmtEth(v)) });
+  }
   function renderCost(buckets, gran) {
     const th = theme(); const labels = bucketLabels(buckets, gran); const bars = useBars(buckets.length);
-    const mk = (l, f, color, soft) => ({ label: l, data: buckets.map(f), backgroundColor: bars ? color : soft, borderColor: color, fill: bars ? undefined : true, borderRadius: 2, borderSkipped: false, fmt: fmtEth });
+    const mk = (l, f, color, soft) => ({ label: l, data: buckets.map((b) => cov(b, f(b))), backgroundColor: bars ? color : soft, borderColor: color, fill: bars ? undefined : true, borderRadius: 2, borderSkipped: false, fmt: fmtEth });
     mount("#c-cost", { type: bars ? "bar" : "line", data: { labels, datasets: [
       mk("At minimum base fee", (b) => Math.max(0, b.ourFeeEth - b.ourPremiumEth), th.ours, th.oursSoft),
       mk("Premium from others' load", (b) => Math.max(0, b.ourPremiumEth - b.ourSelfPremiumEth), th.s4, th.s4 + "55"),
@@ -257,6 +282,7 @@
         ? `history filling in: ${fmtPct((m.backfill.lastBlock - m.backfill.from) / Math.max(1, m.backfill.endBlock - m.backfill.from), 0)} of the ${fmtDur((m.liveFromTs || m.lastBlockTs) - (m.days.length ? Math.min(...m.days.map((d) => d.firstT)) : m.lastBlockTs))} before ${fmtDateTime(m.liveFromTs || m.lastBlockTs)} (there is a gap until it catches up)`
         : `history since ${fmtDateTime(Math.min(...m.days.map((d) => d.firstT)))}`,
       m.fit ? `replay fit ±${fmtPct(m.fit.medianAbsErr, 1)}` : `model replay warming up`,
+      m.lastError ? `<span class="stale">collector error at ${fmtDateTime(m.lastError.at)} (${m.lastError.cursor} ${fmtNum(m.lastError.from)}–${fmtNum(m.lastError.to)}): ${m.lastError.message}</span>` : "",
       m.eventStats && (m.eventStats.tradeSettledByShape || m.eventStats.failedByShape) ? `<span class="stale">event signature changed on chain: ${fmtNum(m.eventStats.tradeSettledByShape + m.eventStats.failedByShape)} events matched by shape — check labels.json / collector</span>` : "",
     ].filter(Boolean).join(" · ");
   }
@@ -411,7 +437,7 @@
     renderOverview(rows, a, b);
     renderTiles(rows);
     renderGas(buckets, state.gran); renderShare(buckets, state.gran); renderRate(buckets, state.gran);
-    renderFee(buckets, state.gran); renderCost(buckets, state.gran);
+    renderFee(buckets, state.gran); renderCost(buckets, state.gran); renderEfficiency(buckets, state.gran); renderCumulative(buckets, state.gran);
     renderTop(a, b, rows); renderRounds(rows); renderBucketTable(buckets, state.gran); renderLimits();
   }
 
