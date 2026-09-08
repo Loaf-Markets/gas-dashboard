@@ -96,7 +96,8 @@
   .meter .fill.hot { background: var(--critical); } .meter .fill.warm { background: var(--serious); } .meter .fill.ok { background: var(--good); }
   .meter .tick { position: absolute; top: -6px; bottom: -6px; width: 2px; background: var(--text); }
   .meter .tick label { position: absolute; top: 100%; left: 50%; transform: translateX(-50%); font-size: 11px; color: var(--text-2); white-space: nowrap; margin-top: 2px; }
-  .meter .marker { position: absolute; top: -8px; transform: translateX(-50%); font-size: 11px; color: var(--text); white-space: nowrap; }
+  .meter .marker { position: absolute; top: -20px; transform: translateX(-50%); font-size: 11px; font-weight: 600; color: var(--text); white-space: nowrap; }
+  .meter { margin-top: 26px; }
   .rank { display: grid; grid-template-columns: minmax(170px, 1.6fr) 3fr auto; gap: 6px 10px; align-items: center; font-size: 13px; margin-top: 8px; }
   .rank .bar { height: 14px; border-radius: 4px; background: var(--rest); }
   .rank .bar.ours { background: var(--ours); } .rank .bar.other-loaf { background: var(--s3); }
