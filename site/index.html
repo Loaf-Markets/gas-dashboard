@@ -70,6 +70,40 @@
   details.help p, details.help li { max-width: 900px; }
   .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); color: var(--text-2); vertical-align: 1px; }
   .pill.good { color: var(--good); border-color: var(--good); } .pill.warn { color: #9a6a00; border-color: var(--warn); } .pill.bad { color: var(--critical); border-color: var(--critical); }
+  .tabs { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+  .tabs button { border: 0; background: transparent; color: var(--text-2); padding: 8px 16px; cursor: pointer; font: inherit; font-weight: 600; }
+  .tabs button + button { border-left: 1px solid var(--border); }
+  .tabs button[aria-pressed="true"] { background: var(--text); color: var(--bg); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  .story { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 14px; min-width: 0; }
+  .grid2 .story { margin-bottom: 0; }
+  .story h3 { margin: 0 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-2); font-weight: 600; }
+  .story .big { font-size: 34px; font-weight: 700; letter-spacing: -.02em; line-height: 1.1; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
+  .story .big small { font-size: 16px; font-weight: 500; color: var(--text-2); margin-left: 6px; }
+  .story p { margin: 6px 0; color: var(--text-2); max-width: 60ch; }
+  .story p b { color: var(--text); }
+  .pbar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: var(--rest-soft); margin: 10px 0 6px; }
+  .pbar span { display: block; height: 100%; min-width: 0; }
+  .pbar .ours { background: var(--ours); } .pbar .other-loaf { background: var(--s3); } .pbar .rest { background: var(--rest); }
+  .pbar .base { background: var(--ours); } .pbar .prem-others { background: var(--s4); } .pbar .prem-self { background: var(--s2); }
+  .pkey { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--text-2); }
+  .pkey i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .meter { position: relative; height: 22px; border-radius: 6px; background: var(--rest-soft); margin: 14px 0 22px; }
+  .meter .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px 0 0 6px; background: var(--ours); }
+  .meter .fill.hot { background: var(--critical); } .meter .fill.warm { background: var(--serious); } .meter .fill.ok { background: var(--good); }
+  .meter .tick { position: absolute; top: -6px; bottom: -6px; width: 2px; background: var(--text); }
+  .meter .tick label { position: absolute; top: 100%; left: 50%; transform: translateX(-50%); font-size: 11px; color: var(--text-2); white-space: nowrap; margin-top: 2px; }
+  .meter .marker { position: absolute; top: -8px; transform: translateX(-50%); font-size: 11px; color: var(--text); white-space: nowrap; }
+  .rank { display: grid; grid-template-columns: minmax(170px, 1.6fr) 3fr auto; gap: 6px 10px; align-items: center; font-size: 13px; margin-top: 8px; }
+  .rank .bar { height: 14px; border-radius: 4px; background: var(--rest); }
+  .rank .bar.ours { background: var(--ours); } .rank .bar.other-loaf { background: var(--s3); }
+  .rank .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .rank .who { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rank .who.ours { font-weight: 700; color: var(--text); }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 99px; font-size: 13px; font-weight: 600; border: 1px solid var(--border); margin: 4px 8px 4px 0; }
+  .badge.good { border-color: var(--good); color: var(--good); } .badge.warn { border-color: var(--warn); color: #b07d00; } .badge.bad { border-color: var(--critical); color: var(--critical); }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .badge.warn { color: var(--warn); } }
   #loading { color: var(--text-2); padding: 40px 0; text-align: center; }
   #error { color: var(--critical); padding: 20px 0; display: none; }
 </style>
@@ -101,6 +135,26 @@
       <h2 style="display:flex;align-items:center;gap:8px">Right now <span class="pill" id="live-status">connecting…</span></h2>
       <div class="sub">Read directly from a public Arbitrum Sepolia RPC by your browser every 30 s, independent of the collector. Rates are over the last ~60 s of blocks; chain gas is sampled (1 in 10 blocks), Loaf gas is exact from receipts.</div>
       <div class="tiles" id="live-tiles" style="margin-bottom:4px"></div>
+    <div class="tabs" id="tabs"><button data-t="overview" aria-pressed="true">Overview</button><button data-t="details">Details &amp; charts</button></div>
+
+    <section id="overview">
+      <div class="story" id="s-status"></div>
+      <div class="grid2">
+        <div class="story" id="s-share"></div>
+        <div class="story" id="s-price"></div>
+        <div class="story" id="s-blame"></div>
+        <div class="story" id="s-cost"></div>
+        <div class="story" id="s-volume"></div>
+        <div class="story" id="s-others"></div>
+      </div>
+      <div class="story" id="s-glossary">
+        <h3>The two words you need</h3>
+        <p><b>Gas</b> is the amount of computing work a transaction needs. Settling one trade costs a fixed amount of work, so "gas" is a fair measure of how much of the chain we are using.</p>
+        <p><b>Base fee</b> is the price the chain charges per unit of gas. It has a floor (0.02 gwei here) and rises automatically when everyone together uses more than the chain's sustained limit, then falls back when demand drops. Nobody sets it; it is a formula. So "12× the floor" means the whole network is busy, not that anything is broken.</p>
+      </div>
+    </section>
+
+    <section id="details" hidden>
     </div>
     <div class="tiles" id="tiles"></div>
 
@@ -165,6 +219,8 @@
         <div class="tablewrap"><table id="t-buckets"></table></div>
       </div>
     </div>
+
+    </section>
 
     <details class="help">
       <summary>How to read this dashboard</summary>

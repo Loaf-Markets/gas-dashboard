@@ -2,7 +2,7 @@
   "0xa1467ffdc95cd2821736ee5b044e14e72cb80fd4": "Loaf Settlement (prod, COMP3)",
   "0x89971ea10f4f26e50f6619db0c9711650dea1cec": "Loaf Settlement (COMP0)",
   "0xa9cc7953e76876293ede98b2fab8de89d8ed85c9": "Loaf Settlement (COMP1)",
-  "0x3f29c4ac2f18a6963dfe3dddb53efefeb3c8e594": "Loaf Settlement (COMP2)",
+  "0x3f29c4ac2f18a6963dfe3dddb53efefeb3c8e594": "Loaf Settlement (staging, COMP2)",
   "0x9e1cfad2308afe3c5f219a8a2c2142868a7f2215": "Loaf PropertyTokenFactory",
   "0x519c4739db846419feffdff0cf3d3337983bad28": "Loaf payment token (USDC test)",
   "0x904c32a325999c6ca6547b5a78d97fc7db4a5fec": "Loaf AccessManager",

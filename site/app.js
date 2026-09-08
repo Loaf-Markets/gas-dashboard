@@ -3,7 +3,7 @@
   const DATA = "data/";
   const $ = (s) => document.querySelector(s);
   const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-  const state = { meta: null, days: new Map(), range: "24h", gran: "hour", focus: null, custom: null, charts: {} };
+  const state = { meta: null, days: new Map(), range: "24h", gran: "hour", focus: null, custom: null, charts: {}, tab: "overview" };
 
   // ───────── formatting ─────────
   const fmtGas = (g) => g >= 1e9 ? (g / 1e9).toFixed(2) + " Ggas" : g >= 1e6 ? (g / 1e6).toFixed(2) + " Mgas" : g >= 1e3 ? (g / 1e3).toFixed(1) + " kgas" : Math.round(g) + " gas";
@@ -265,6 +265,84 @@
     $("#t-limits").innerHTML = `<thead><tr><th>Window</th><th class="num">Target gas/s</th><th class="num">Trades/s at 177k gas</th></tr></thead><tbody>${cons.map((c) => `<tr><td>${fmtDur(c.window)} (${c.window} s)</td><td class="num">${fmtGas(c.target)}/s</td><td class="num">${(c.target / 177000).toFixed(0)}</td></tr>`).join("")}</tbody>`;
   }
 
+  // ───────── overview (plain-language, illustrative) ─────────
+  const pct = (x, d = 0) => (x * 100).toFixed(d) + "%";
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+  function renderOverview(rows, a, b) {
+    const m = state.meta; const min = m.minBaseFee; const t = total(rows);
+    const name = focusName();
+    const spanDays = (b - a) / 86400;
+    const rangeWord = state.range === "custom" ? "in the selected period" : state.range === "all" ? "over all collected history" : `in the last ${state.range.replace("h", " hours").replace("d", " days")}`;
+    const floor = m.constraints?.length ? Math.min(...m.constraints.map((c) => c.target)) : null;
+    const others = Object.entries(t.per).filter(([k]) => k !== "all" && k !== state.focus);
+    const otherLoafGas = state.focus === "all" ? 0 : others.reduce((s, [, v]) => s + v.gas, 0);
+    const restGas = Math.max(0, t.chainGas - t.ourGas - otherLoafGas);
+    const load = floor ? t.chainRate / floor : null;
+    const priceMult = t.baseFeeAvg / min;
+    const lastRow = [...rows].reverse().find((r) => r.blocks > 0);
+    const nowMult = lastRow ? lastRow.baseFeeAvg / min : priceMult;
+
+    // status badges
+    const feeLevel = nowMult < 2 ? ["good", "Price is calm"] : nowMult < 8 ? ["warn", "Price is elevated"] : ["bad", "Price is high"];
+    const shareLevel = t.share < 0.05 ? ["good", "We are a small user of the chain"] : t.share < 0.2 ? ["warn", "We are a noticeable user of the chain"] : ["bad", "We are one of the biggest users of the chain"];
+    const blameLevel = t.uplift < 0.05 ? ["good", "The high price is mostly not caused by us"] : t.uplift < 0.3 ? ["warn", "We contribute to the high price"] : ["bad", "We are a main cause of the high price"];
+    $("#s-status").innerHTML = `<h3>${name} · ${rangeWord}</h3>
+      <div><span class="badge ${feeLevel[0]}">${feeLevel[1]}: ${nowMult.toFixed(1)}× the floor</span><span class="badge ${shareLevel[0]}">${shareLevel[1]}: ${pct(t.share, 1)} of all gas</span><span class="badge ${blameLevel[0]}">${blameLevel[1]}: ${pct(t.uplift, 1)} of the elevation is ours</span></div>
+      <p>${fmtNum(t.ourTrades)} trades were settled ${rangeWord}, costing <b>${fmtEth(t.ourFeeEth)}</b> in network fees${t.seconds ? ` (a pace of <b>${fmtEth(t.ourFeeEth / t.seconds * 86400)} per day</b>)` : ""}. ${t.ourFeeEth ? `${pct(t.ourPremiumEth / t.ourFeeEth)} of that fee was congestion premium: the price was above the floor because the whole network was busy.` : ""}</p>`;
+
+    // 1. share of chain
+    const oursPct = t.chainGas ? t.ourGas / t.chainGas : 0, otherLoafPct = t.chainGas ? otherLoafGas / t.chainGas : 0;
+    $("#s-share").innerHTML = `<h3>How much of the chain are we using?</h3>
+      <div class="big">${pct(oursPct, 1)}<small>of all gas used on Arbitrum Sepolia</small></div>
+      <div class="pbar"><span class="ours" style="width:${oursPct * 100}%" title="${name}"></span>${otherLoafPct ? `<span class="other-loaf" style="width:${otherLoafPct * 100}%"></span>` : ""}<span class="rest" style="width:${(1 - oursPct - otherLoafPct) * 100}%"></span></div>
+      <div class="pkey"><span><i style="background:var(--ours)"></i>${name} ${pct(oursPct, 1)}</span>${otherLoafPct ? `<span><i style="background:var(--s3)"></i>other Loaf contracts ${pct(otherLoafPct, 1)}</span>` : ""}<span><i style="background:var(--rest)"></i>everyone else ${pct(1 - oursPct - otherLoafPct, 1)}</span></div>
+      <p>Think of the chain as a shared road. ${rangeWord[0].toUpperCase() + rangeWord.slice(1)}, ${name} accounted for about <b>1 in ${oursPct ? Math.round(1 / oursPct) : "–"}</b> of every unit of work the network did.</p>`;
+
+    // 2. price and why
+    const loadPct = load == null ? 0 : load;
+    const loadClass = loadPct < 0.9 ? "ok" : loadPct < 1.05 ? "warm" : "hot";
+    $("#s-price").innerHTML = `<h3>Is it expensive right now, and why?</h3>
+      <div class="big">${nowMult.toFixed(1)}×<small>the floor price (${fmtGwei(lastRow ? lastRow.baseFeeAvg : t.baseFeeAvg)})</small></div>
+      <p>The price rises when <b>everyone together</b> uses more than the chain's sustained limit${floor ? ` of ${fmtGas(floor)} per second` : ""}. ${rangeWord[0].toUpperCase() + rangeWord.slice(1)} the network ran at:</p>
+      <div class="meter"><div class="fill ${loadClass}" style="width:${clamp(loadPct, 0, 1.5) / 1.5 * 100}%"></div><div class="tick" style="left:${100 / 1.5}%"><label>limit (100%)</label></div><div class="marker" style="left:${clamp(loadPct, 0, 1.5) / 1.5 * 100}%">${pct(loadPct)} of the limit</div></div>
+      <p>${loadPct > 1 ? `Above the limit, so the price stays elevated for everybody. Our part of that load is <b>${pct(t.share, 1)}</b>; even with us gone the network would be at <b>${pct(Math.max(0, (t.chainRate - t.ourRate) / (floor || 1)))}</b> of the limit.` : `Below the limit, so the price should drift back toward the floor.`}</p>`;
+
+    // 3. blame
+    $("#s-blame").innerHTML = `<h3>Whose traffic is raising the price?</h3>
+      <div class="big">${pct(t.uplift, 1)}<small>of the price elevation is caused by ${name}</small></div>
+      <div class="pbar"><span class="ours" style="width:${t.uplift * 100}%"></span><span class="rest" style="width:${(1 - t.uplift) * 100}%"></span></div>
+      <div class="pkey"><span><i style="background:var(--ours)"></i>caused by our traffic ${pct(t.uplift, 1)}</span><span><i style="background:var(--rest)"></i>caused by everyone else ${pct(1 - t.uplift, 1)}</span></div>
+      <p>Computed by replaying the chain's own pricing formula with our transactions removed. ${m.modelWarmAt && a < m.modelWarmAt ? "<b>Still warming up:</b> the formula looks back 24 hours, so this number is understated until a full day of history is collected." : "If we stopped completely, the price would fall by about that much, and no more."}</p>`;
+
+    // 4. cost
+    const base = Math.max(0, t.ourFeeEth - t.ourPremiumEth), premOthers = Math.max(0, t.ourPremiumEth - t.ourSelfPremiumEth), premSelf = t.ourSelfPremiumEth;
+    const tot = t.ourFeeEth || 1;
+    $("#s-cost").innerHTML = `<h3>What did it cost, and what for?</h3>
+      <div class="big">${fmtEth(t.ourFeeEth)}<small>${t.ourTrades ? `≈ ${fmtEth(t.ourFeeEth / t.ourTrades)} per trade` : ""}</small></div>
+      <div class="pbar"><span class="base" style="width:${base / tot * 100}%"></span><span class="prem-others" style="width:${premOthers / tot * 100}%"></span><span class="prem-self" style="width:${premSelf / tot * 100}%"></span></div>
+      <div class="pkey"><span><i style="background:var(--ours)"></i>floor price ${pct(base / tot)}</span><span><i style="background:var(--s4)"></i>premium from others' congestion ${pct(premOthers / tot)}</span><span><i style="background:var(--s2)"></i>premium from our own congestion ${pct(premSelf / tot)}</span></div>
+      <p>At the floor price the same work would have cost <b>${fmtEth(base)}</b>. The rest is the congestion premium. Batching more trades per transaction lowers the work per trade (currently <b>${t.ourTxs ? (t.ourTrades / t.ourTxs).toFixed(1) : "–"} trades per batch</b>, ${t.ourTrades ? fmtGas(t.ourGas / t.ourTrades) : "–"} per trade).</p>`;
+
+    // 5. volume
+    const perMin = t.seconds ? t.ourTrades / (t.seconds / 60) : 0;
+    $("#s-volume").innerHTML = `<h3>How busy were we?</h3>
+      <div class="big">${fmtNum(t.ourTrades)}<small>trades settled${t.ourFailed ? `, ${fmtNum(t.ourFailed)} failed legs` : ""}</small></div>
+      <p>That is about <b>${fmtNum(perMin)} trades per minute</b> in <b>${fmtNum(t.ourTxs)}</b> on-chain transactions${spanDays >= 1 ? `, or <b>${fmtNum(t.ourTrades / spanDays)} trades per day</b>` : ""}. ${floor ? `The chain can sustain roughly <b>${fmtNum(floor / 177000 * 60)} trades per minute</b> of our kind of work before the price starts rising, if nobody else were using it.` : ""}</p>`;
+
+    // 6. others
+    const N = m.sampleEvery; const agg = new Map(); let otherGasSum = 0;
+    for (const d of datesBetween(a, b)) { const day = state.days.get(d); if (!day) continue; for (const [hk, hm] of Object.entries(day.topHours)) { const h = Number(hk); if (h + 3600 <= a || h >= b) continue; for (const [addr, [gas]] of Object.entries(hm)) { if (addr === "_other") { otherGasSum += gas; continue; } agg.set(addr, (agg.get(addr) || 0) + gas); } } }
+    const list = [...agg.entries()].sort((x, y) => y[1] - x[1]);
+    const sampledTotal = list.reduce((s, [, v]) => s + v, 0) + otherGasSum;
+    const tracked = trackedAddrs(); const focus = focusAddrs();
+    const rank = list.findIndex(([addr]) => focus.has(addr)) + 1;
+    const top = list.slice(0, 7); const maxV = top[0]?.[1] || 1;
+    $("#s-others").innerHTML = `<h3>Who else is using the chain?</h3>
+      <div class="big">${rank ? `#${rank}<small>${name} ranks ${rank === 1 ? "first" : `${rank}${rank === 2 ? "nd" : rank === 3 ? "rd" : "th"}`} among all gas users</small>` : `–<small>not in the sampled top list</small>`}</div>
+      <div class="rank">${top.map(([addr, v]) => `<div class="who ${focus.has(addr) ? "ours" : ""}" title="${addr}">${label(addr) || short(addr)}</div><div class="bar ${focus.has(addr) ? "ours" : tracked.has(addr) ? "other-loaf" : ""}" style="width:${v / maxV * 100}%"></div><div class="n">${sampledTotal ? pct(v / sampledTotal, 1) : "–"}</div>`).join("")}</div>
+      <p>Shares are estimated from a sample of blocks. Unlabelled addresses are other projects on the testnet; the biggest ones are usually load generators or other teams' competitions.</p>`;
+  }
+
   // ───────── live strip (browser → public RPC) ─────────
   const LIVE_RPCS = ["https://arbitrum-sepolia-rpc.publicnode.com", "https://sepolia-rollup.arbitrum.io/rpc", "https://arbitrum-sepolia.rpc.thirdweb.com"];
   let liveRpcIdx = 0, liveTimer = null, liveBusy = false;
@@ -330,6 +408,7 @@
     const rows = minuteRows(a, b);
     const buckets = bucketize(rows, state.gran);
     $("#rangeInfo").textContent = `${fmtDateTime(a)} → ${fmtDateTime(b - 60)} · ${buckets.length} buckets`;
+    renderOverview(rows, a, b);
     renderTiles(rows);
     renderGas(buckets, state.gran); renderShare(buckets, state.gran); renderRate(buckets, state.gran);
     renderFee(buckets, state.gran); renderCost(buckets, state.gran);
@@ -347,12 +426,17 @@
     if (h.get("range")) state.range = h.get("range");
     if (h.get("bucket")) state.gran = h.get("bucket");
     if (h.get("focus")) state.focus = h.get("focus");
+    if (h.get("tab")) state.tab = h.get("tab");
     if (h.get("from") && h.get("to")) { state.custom = [Number(h.get("from")), Number(h.get("to"))]; state.range = "custom"; }
   }
   function writeHash() {
-    const h = new URLSearchParams({ range: state.range, bucket: state.gran, focus: state.focus });
+    const h = new URLSearchParams({ tab: state.tab, range: state.range, bucket: state.gran, focus: state.focus });
     if (state.range === "custom" && state.custom) { h.set("from", state.custom[0]); h.set("to", state.custom[1]); }
     history.replaceState(null, "", "#" + h.toString());
+  }
+  function applyTab() {
+    $("#overview").hidden = state.tab !== "overview"; $("#details").hidden = state.tab !== "details";
+    $("#gran").parentElement.style.display = state.tab === "details" ? "" : "none";
   }
   function pressOnly(id, attr, value) {
     document.querySelectorAll(`${id} button`).forEach((x) => x.setAttribute("aria-pressed", String(x.dataset[attr] === value)));
@@ -367,7 +451,9 @@
       const f = Date.parse($("#from").value + "Z") / 1000, t = Date.parse($("#to").value + "Z") / 1000;
       if (Number.isFinite(f) && Number.isFinite(t) && t > f) { state.custom = [f, t]; writeHash(); render().catch(showErr); }
     });
-    pressOnly("#range", "r", state.range); pressOnly("#gran", "g", state.gran); pressOnly("#focus", "f", state.focus);
+    seg("#tabs", "t", (v) => { state.tab = v; applyTab(); writeHash(); for (const c of Object.values(state.charts)) c.resize(); });
+    pressOnly("#range", "r", state.range); pressOnly("#gran", "g", state.gran); pressOnly("#focus", "f", state.focus); pressOnly("#tabs", "t", state.tab);
+    applyTab();
     $("#customRange").hidden = state.range !== "custom";
     matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => render().catch(showErr));
   }
