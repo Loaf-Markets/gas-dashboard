@@ -236,7 +236,7 @@
       [`${focusName()} gas used`, fmtGas(t.ourGas), `${fmtPct(t.share)} of chain gas · ${fmtNum(t.blocks)} blocks${state.focus === "all" ? ` · ${perLine}` : ""}`],
       ["Trades settled", fmtNum(t.ourTrades), `${fmtNum(t.ourTxs)} batch txs · ${t.ourTrades ? fmtGas(t.ourGas / t.ourTrades) : "–"} per trade · ${t.ourTxs ? (t.ourTrades / t.ourTxs).toFixed(2) : "–"} trades/batch${t.ourFailed ? ` · ${fmtNum(t.ourFailed)} failed legs` : ""}`],
       ["ETH spent on gas", fmtEth(t.ourFeeEth), `${fmtEth(t.ourPremiumEth)} (${t.ourFeeEth ? fmtPct(t.ourPremiumEth / t.ourFeeEth) : "–"}) above the floor price · ${t.seconds ? fmtEth(t.ourFeeEth / t.seconds * 86400) + "/day pace" : ""}`],
-      ["Base fee now", `${nowMult.toFixed(1)}× min <span class="pill ${feePill}">${last ? fmtGwei(last.baseFeeAvg) : "–"}</span>`, `range avg ${(t.baseFeeAvg / min).toFixed(1)}× · max ${(t.baseFeeMax / min).toFixed(1)}× · min ${fmtGwei(min)}`],
+      ["Base fee at last collected block", `${nowMult.toFixed(1)}× min <span class="pill ${feePill}">${last ? fmtGwei(last.baseFeeAvg) : "–"}</span>`, `range avg ${(t.baseFeeAvg / min).toFixed(1)}× · max ${(t.baseFeeMax / min).toFixed(1)}× · min ${fmtGwei(min)}`],
       ["Elevation we cause", fmtPct(t.uplift), `self-inflicted premium ${fmtEth(t.ourSelfPremiumEth)} · imposed on others ${fmtEth(t.othersPremiumCausedEth)}`],
       [`${focusName()} gas rate`, fmtGas(t.ourRate) + "/s", `chain ${fmtGas(t.chainRate)}/s${floor ? ` · indefinite target ${fmtGas(floor)}/s` : ""}`],
     ];
@@ -264,6 +264,64 @@
     const cons = state.meta.constraints || [];
     $("#t-limits").innerHTML = `<thead><tr><th>Window</th><th class="num">Target gas/s</th><th class="num">Trades/s at 177k gas</th></tr></thead><tbody>${cons.map((c) => `<tr><td>${fmtDur(c.window)} (${c.window} s)</td><td class="num">${fmtGas(c.target)}/s</td><td class="num">${(c.target / 177000).toFixed(0)}</td></tr>`).join("")}</tbody>`;
   }
+
+  // ───────── live strip (browser → public RPC) ─────────
+  const LIVE_RPCS = ["https://arbitrum-sepolia-rpc.publicnode.com", "https://sepolia-rollup.arbitrum.io/rpc", "https://arbitrum-sepolia.rpc.thirdweb.com"];
+  let liveRpcIdx = 0, liveTimer = null, liveBusy = false;
+  async function liveRpc(calls) {
+    for (let attempt = 0; attempt < LIVE_RPCS.length; attempt++) {
+      const ep = LIVE_RPCS[(liveRpcIdx + attempt) % LIVE_RPCS.length];
+      try {
+        const res = await fetch(ep, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(calls.map((c, i) => ({ jsonrpc: "2.0", id: i, method: c.method, params: c.params }))), signal: AbortSignal.timeout(20000) });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const arr = await res.json();
+        const out = new Array(calls.length); for (const r of (Array.isArray(arr) ? arr : [arr])) out[r.id] = r;
+        if (out.some((r) => !r || r.error)) throw new Error(out.find((r) => r?.error)?.error?.message || "rpc error");
+        liveRpcIdx = (liveRpcIdx + attempt) % LIVE_RPCS.length;
+        return out.map((r) => r.result);
+      } catch (e) { if (attempt === LIVE_RPCS.length - 1) throw e; }
+    }
+  }
+  async function liveTick() {
+    if (liveBusy || document.hidden || !state.meta) return;
+    liveBusy = true;
+    const st = $("#live-status");
+    try {
+      const m = state.meta; const min = m.minBaseFee; const WINDOW = 240; const STRIDE = 10;
+      const [headHex, fees] = await liveRpc([{ method: "eth_blockNumber", params: [] }, { method: "eth_feeHistory", params: ["0x12c", "latest", []] }]);
+      const head = parseInt(headHex, 16); const from = head - WINDOW + 1;
+      const baseFees = fees.baseFeePerGas.map((x) => Number(BigInt(x)));
+      const bfNow = baseFees[baseFees.length - 1]; const bfAgo = baseFees[0];
+      const sampleCalls = []; for (let n = from; n <= head; n += STRIDE) sampleCalls.push({ method: "eth_getBlockByNumber", params: ["0x" + n.toString(16), false] });
+      const [logs, ...hdrs] = await liveRpc([{ method: "eth_getLogs", params: [{ address: m.tracked.map((t) => t.addr), fromBlock: "0x" + from.toString(16), toBlock: "0x" + head.toString(16) }] }, ...sampleCalls]);
+      const ts = hdrs.map((h) => parseInt(h.timestamp, 16)); const span = Math.max(1, ts[ts.length - 1] - ts[0]);
+      const chainGasRate = hdrs.reduce((a, h) => a + parseInt(h.gasUsed, 16), 0) * STRIDE / span;
+      const byAddr = new Map(m.tracked.map((t) => [t.addr, { name: t.name, txs: new Set(), trades: 0, failed: 0 }]));
+      for (const l of logs) { const e = byAddr.get(l.address.toLowerCase()); if (!e) continue; e.txs.add(l.transactionHash); const w = (l.data.length - 2) / 64; if (l.topics.length === 4 && w === 6) e.trades++; else if (l.topics.length === 2 && w >= 3) e.failed++; }
+      const hashes = [...new Set(logs.map((l) => l.transactionHash))].slice(0, 700);
+      let ourGas = 0, ourFeeWei = 0;
+      for (let i = 0; i < hashes.length; i += 100) {
+        const rcs = await liveRpc(hashes.slice(i, i + 100).map((h) => ({ method: "eth_getTransactionReceipt", params: [h] })));
+        for (const rc of rcs) if (rc) { const g = parseInt(rc.gasUsed, 16); ourGas += g; ourFeeWei += g * Number(BigInt(rc.effectiveGasPrice)); }
+      }
+      const ourRate = ourGas / span; const perMin = (n) => (n * 60 / span);
+      const truncated = hashes.length === 700;
+      const mult = bfNow / min; const pill = mult < 2 ? "good" : mult < 8 ? "warn" : "bad";
+      const tiles = [
+        ["Base fee now", `${mult.toFixed(1)}× min <span class="pill ${pill}">${fmtGwei(bfNow)}</span>`, `${bfNow >= bfAgo ? "▲" : "▼"} ${fmtPct(Math.abs(bfNow / bfAgo - 1))} over the last 300 blocks`],
+        ["Loaf trades / min", fmtNum(perMin([...byAddr.values()].reduce((a, e) => a + e.trades, 0))), [...byAddr.values()].map((e) => `${e.name} ${fmtNum(perMin(e.trades))}`).join(" · ") + ([...byAddr.values()].some((e) => e.failed) ? ` · ${fmtNum([...byAddr.values()].reduce((a, e) => a + e.failed, 0))} failed legs` : "")],
+        ["Loaf batches / min", fmtNum(perMin([...byAddr.values()].reduce((a, e) => a + e.txs.size, 0))), [...byAddr.values()].map((e) => `${e.name} ${fmtNum(perMin(e.txs.size))}`).join(" · ")],
+        ["Loaf gas rate", fmtGas(ourRate) + "/s" + (truncated ? " (partial)" : ""), `chain ≈ ${fmtGas(chainGasRate)}/s · share ≈ ${fmtPct(chainGasRate ? ourRate / chainGasRate : 0)}`],
+        ["Loaf spend pace", fmtEth(ourFeeWei / 1e18 / span * 86400) + "/day", `${fmtEth(ourFeeWei / 1e18)} in the last ${Math.round(span)} s`],
+        ["Chain head", fmtNum(head), `${(WINDOW / span).toFixed(1)} blocks/s · ${fmtNum(head - m.lastBlock)} blocks ahead of the collector`],
+      ];
+      $("#live-tiles").innerHTML = tiles.map(([k, v, s]) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`).join("");
+      st.textContent = `live · ${new Date().toISOString().slice(11, 19)} UTC · ${new URL(LIVE_RPCS[liveRpcIdx]).host}`; st.className = "pill good";
+    } catch (e) {
+      st.textContent = "live feed unavailable (" + (e.message || e) + ")"; st.className = "pill bad";
+    } finally { liveBusy = false; }
+  }
+  function startLive() { liveTick(); liveTimer = setInterval(liveTick, 30000); document.addEventListener("visibilitychange", () => { if (!document.hidden) liveTick(); }); }
 
   // ───────── orchestration ─────────
   async function render() {
@@ -325,6 +383,7 @@
       const lastT = state.meta.lastBlockTs; const iso = (t) => new Date(t * 1000).toISOString().slice(0, 16);
       $("#from").value = iso(state.custom ? state.custom[0] : lastT - 86400); $("#to").value = iso(state.custom ? state.custom[1] : lastT);
       $("#controls").hidden = false; $("#app").hidden = false; $("#loading").remove();
+      startLive();
       await render();
     } catch (e) { showErr(e); }
   })();

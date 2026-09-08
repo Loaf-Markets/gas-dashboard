@@ -44,6 +44,7 @@
   .controls input[type=datetime-local] { font: inherit; font-size: 13px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
   .tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; min-height: 92px; }
+  #live-tiles .tile { background: var(--bg); }
   .tile .k { color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
   .tile .v { font-size: 24px; font-weight: 650; letter-spacing: -.01em; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
   .tile .s { color: var(--text-3); font-size: 12px; }
@@ -96,6 +97,11 @@
   <div id="error"></div>
 
   <div id="app" hidden>
+    <div class="card" style="margin-bottom:14px" id="live-card">
+      <h2 style="display:flex;align-items:center;gap:8px">Right now <span class="pill" id="live-status">connecting…</span></h2>
+      <div class="sub">Read directly from a public Arbitrum Sepolia RPC by your browser every 30 s, independent of the collector. Rates are over the last ~60 s of blocks; chain gas is sampled (1 in 10 blocks), Loaf gas is exact from receipts.</div>
+      <div class="tiles" id="live-tiles" style="margin-bottom:4px"></div>
+    </div>
     <div class="tiles" id="tiles"></div>
 
     <div class="grid">

@@ -1,7 +1,10 @@
 # Collect settlement gas data from public Arbitrum Sepolia RPCs and publish the
-# static dashboard to GitHub Pages. Runs every 30 min; every run is incremental and
-# checkpointed, so a run that hits its time budget simply resumes on the next tick
-# (the concurrency group queues at most one follow-up run behind a long one).
+# static dashboard to GitHub Pages. Runs every 10 min; every run is incremental and
+# checkpointed, so a run that hits its time budget simply resumes on the next tick.
+#
+# State lives in the Actions cache between runs (fast, no commit noise) and is
+# checkpointed into git every 6 h so a cache eviction costs at most 6 h of re-scan.
+# To restart from scratch: delete data/ in git AND bump DATA_EPOCH below.
 #
 # Repo settings needed once: Settings → Pages → Source = "GitHub Actions".
 # Optional secret RPC_URLS (comma-separated) to add a keyed provider for speed.
@@ -9,7 +12,7 @@ name: gas-dashboard
 
 on:
   schedule:
-    - cron: "7,37 * * * *"    # every 30 min, off the top of the hour (GitHub cron is contended at :00)
+    - cron: "*/10 * * * *"    # every 10 min; the concurrency group queues at most one run behind a long one
   workflow_dispatch:
     inputs:
       max_run_minutes:
@@ -20,6 +23,9 @@ permissions:
   contents: write            # commit data/ back to the repo
   pages: write
   id-token: write
+
+env:
+  DATA_EPOCH: "1"
 
 concurrency:
   group: gas-dashboard
@@ -41,20 +47,37 @@ jobs:
         with:
           node-version: 22
 
+      - name: Restore data from cache (newer than the git checkpoint)
+        if: hashFiles('data/state.json') != ''      # a deleted data/ in git means "restart" — do not resurrect old state
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_id }}
+          restore-keys: gas-data-${{ env.DATA_EPOCH }}-
+
       - name: Collect
         env:
           RPC_URLS: ${{ secrets.RPC_URLS }}          # empty → built-in public endpoints
           MAX_RUN_MINUTES: ${{ github.event.inputs.max_run_minutes || '45' }}
         run: node collect.mjs
 
-      - name: Commit data
+      - name: Save data to cache
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_id }}
+
+      - name: Checkpoint data into git (every 6 h)
         run: |
           git config user.name "gas-dashboard[bot]"
           git config user.email "gas-dashboard@users.noreply.github.com"
+          last=$(git log -1 --format=%ct -- data/state.json || echo 0)
+          age=$(( $(date +%s) - ${last:-0} ))
           git add data
           if git diff --cached --quiet; then echo "no data change"; exit 0; fi
-          git commit -m "data: through block $(node -p "require('./data/state.json').lastBlock")"
-          # another run may have pushed meanwhile (manual dispatch + cron): rebase, never force
+          if [ "$age" -lt 21600 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then echo "last checkpoint ${age}s ago; skipping commit"; git reset -q; exit 0; fi
+          git commit -m "data: live through block $(node -p "require('./data/state.json').cursors.live.lastBlock")"
+          # another run may have pushed meanwhile: rebase, never force
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
