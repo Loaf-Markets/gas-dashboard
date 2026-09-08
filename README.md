@@ -6,11 +6,17 @@ how much of the base-fee elevation we cause ourselves, what that costs in ETH, a
 who else is burning gas on the chain. Prod and staging are tracked as separate
 contracts (they live on the same chain) with a Prod / Staging / All Loaf switch.
 
-Hosted on **GitHub Pages** from a public repo, refreshed hourly by a GitHub Action,
-fed only by **public RPC endpoints** — no Grafana, no VPN, no secrets, no bridge box.
+Hosted on **GitHub Pages** from a public repo, refreshed every 10 minutes by a GitHub
+Action, fed only by **public RPC endpoints** — no Grafana, no VPN, no secrets, no
+bridge box. On top of the collected history the page has a **"Right now" strip** that
+the browser reads straight from a public RPC every 30 s (base fee, trades and
+batches per minute, gas rate and share, spend pace), so the live picture never waits
+for the collector.
 
 ```
-collect.mjs  ──(hourly cron)──▶ data/days/YYYY-MM-DD.json + data/index.json ──▶ site/ on Pages
+collect.mjs ──(cron */10)──▶ data/days/YYYY-MM-DD.json + data/index.json ──▶ site/ on Pages
+                               │ state in the Actions cache; git checkpoint every 6 h
+browser ──(every 30 s)──▶ public RPC: feeHistory + getLogs + sampled headers + receipts
 ```
 
 ## Why this shape
@@ -42,8 +48,9 @@ gh workflow run gas-dashboard --repo Loaf-Markets/gas-dashboard
 ```
 
 The site appears at `https://loaf-markets.github.io/gas-dashboard/` after the first
-successful run (~2 min for the deploy step; the collector step runs up to 45 min
-per hour until the backfill catches up).
+successful run. The live cursor makes the page current within the first run; the
+collector then keeps running back-to-back (45 min budget per run) until the 3-day
+backfill is done, after which each 10-minute run takes a minute or two.
 
 Measured alternatives that did NOT help: the Etherscan V2 `txlist` API (63 s per
 1,000 transactions on this chain, capped at 1,000 rows — slower than batched RPC
@@ -121,6 +128,7 @@ share would add on top and is not affected by congestion or by deferring batches
 
 ## Data layout
 
+- `data/.checkpoint` — epoch of the last git checkpoint (the cache always has fresher data).
 - `data/state.json` — the two cursors (`live`, `backfill`), each with its scan position,
   model backlogs and round-detector state. Delete to restart. A v1 single-cursor state is
   migrated automatically (it becomes the backfill; a fresh live cursor starts near the tip).
@@ -139,8 +147,11 @@ loads the days in the selected range.
   can be missed or over-weighted. Widen the range to smooth it, or lower
   `SAMPLE_EVERY` (more RPC calls).
 - The public RPCs sometimes rate-limit hard for minutes at a time; the run then
-  simply ends at its time budget and resumes next hour. "updated N h ago" in the
-  header turns red past 3 h.
+  simply ends at its time budget and resumes on the next tick. "updated N h ago" in
+  the header turns red past 3 h. The "Right now" strip has its own status pill and
+  falls back across three endpoints.
+- If the Actions cache is evicted (it is LRU with a 10 GB cap and expires after 7 days
+  unused), the next run resumes from the last git checkpoint, at most 6 h behind.
 - Timestamps are block timestamps (UTC). Minutes with no block on the chain are
   shown as zero.
 - While the backfill is still running there is a gap between the oldest backfilled
