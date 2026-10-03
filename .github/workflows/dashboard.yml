@@ -22,11 +22,13 @@ on:
         description: "Set by the workflow itself when it schedules its successor (a chained run checkpoints on the 6 h rule, a manual one always)"
         default: "false"
 
+# Least privilege: `contents: write` is needed for the data checkpoint commit and
+# `actions: write` for the self-dispatch, but they are granted at JOB scope and only
+# where used. Top level stays read-only so a future step that forgets to need write
+# cannot silently get it.
 permissions:
-  contents: write            # commit data/ back to the repo
-  actions: write             # re-dispatch this workflow
-  pages: write
-  id-token: write
+  contents: read
+  pages: read
 
 env:
   DATA_EPOCH: "1"
@@ -39,13 +41,20 @@ jobs:
   collect-and-publish:
     runs-on: ubuntu-latest
     timeout-minutes: 58
+    permissions:
+      contents: write            # commit data/ back to the repo (checkpoint step only)
+      actions: write             # re-dispatch this workflow (last step only)
+      pages: write               # deploy the Pages artifact
+      id-token: write            # OIDC token for the Pages deployment
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 1
+          # The checkpoint step rebases onto origin before pushing; a depth-1 clone has
+          # no remote branch to rebase onto, so fetch the history it needs.
+          fetch-depth: 0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -59,7 +68,11 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: data
-          key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_id }}
+          # Keyed on the RUN START TIME, not run_id: a per-run_id key is never an exact
+          # cache hit (every run has a new id), so every run missed the exact key and only
+          # ever matched the restore-keys prefix. Using run_started_at makes the save a real
+          # hit when two runs fall inside one 10-minute bucket, and keeps the fallback.
+          key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_started_at }}
           restore-keys: gas-data-${{ env.DATA_EPOCH }}-
 
       - name: Collect
@@ -70,10 +83,17 @@ jobs:
 
       - name: Decide whether to checkpoint into git (every 6 h, or on manual dispatch)
         id: ckpt
+        env:
+          # Pass attacker-controllable values through the environment, never interpolate
+          # ${{ }} straight into the shell body. A workflow_dispatch input is only as
+          # trusted as whoever can dispatch; here that could inject shell syntax into
+          # the test below and run it with the job's write token.
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CHAINED: ${{ inputs.chained }}
         run: |
           last=$(cat data/.checkpoint 2>/dev/null || echo 0)
           age=$(( $(date +%s) - last ))
-          manual=$([ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.chained }}" != "true" ] && echo yes || echo no)
+          manual=$([ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_CHAINED" != "true" ] && echo yes || echo no)
           if [ "$age" -ge 21600 ] || [ "$manual" = "yes" ]; then
             date +%s > data/.checkpoint; echo "commit=true" >> "$GITHUB_OUTPUT"; echo "checkpoint (last one ${age}s ago)"
           else
@@ -84,19 +104,28 @@ jobs:
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: data
-          key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_id }}
+          key: gas-data-${{ env.DATA_EPOCH }}-${{ github.run_started_at }}
 
       - name: Checkpoint data into git
         if: steps.ckpt.outputs.commit == 'true'
+        env:
+          # GITHUB_REF_NAME is derived from the ref, so pass it through the environment
+          # rather than interpolating it into the shell body.
+          REF_NAME: ${{ github.ref_name }}
         run: |
           git config user.name "gas-dashboard[bot]"
           git config user.email "gas-dashboard@users.noreply.github.com"
           git add data
           if git diff --cached --quiet; then echo "no data change"; exit 0; fi
           git commit -m "data: live through block $(node -p "require('./data/state.json').cursors.live.lastBlock")"
-          # another run may have pushed meanwhile: rebase, never force
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          # Another run may have pushed meanwhile. Rebase onto the CURRENT remote tip,
+          # fetched explicitly: a depth-1 clone has no remote tracking branch to rebase
+          # onto, and `git pull --rebase` against a stale local ref either fails or
+          # re-pushes an old base. --force-with-lease then refuses rather than clobbering
+          # a commit that landed between the fetch and the push.
+          git fetch origin "$REF_NAME"
+          git rebase "origin/$REF_NAME" || { echo "rebase failed - leaving the commit for the next run"; exit 0; }
+          git push --force-with-lease origin "HEAD:$REF_NAME"
 
       - name: Assemble site
         run: |
@@ -122,13 +151,18 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REF_NAME: ${{ github.ref_name }}
+          # Only the workflow itself may chain. Without this, a manual dispatch also
+          # re-dispatches itself and two chains can race, each spawning the other.
+          INPUT_CHAINED: ${{ inputs.chained }}
         run: |
           done=$(node -p "const s=require('./data/state.json'); !s.cursors.backfill || s.cursors.backfill.lastBlock >= s.cursors.backfill.endBlock")
           if [ "$done" = "true" ]; then
-            start=$(date -d "$(gh run view ${{ github.run_id }} --json createdAt --jq .createdAt)" +%s)
+            start=$(date -d "$(gh run view "$RUN_ID" --json createdAt --jq .createdAt)" +%s)
             wait=$(( 600 - ( $(date +%s) - start ) ))
             if [ "$wait" -gt 0 ]; then echo "backfill done; sleeping ${wait}s before the next run"; sleep "$wait"; fi
           else
             echo "backfill still running; re-dispatching immediately"
           fi
-          gh workflow run gas-dashboard --ref "${GITHUB_REF_NAME}" -f chained=true
+          gh workflow run gas-dashboard --ref "$REF_NAME" -f chained=true
