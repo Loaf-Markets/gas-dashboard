@@ -1,6 +1,8 @@
-import test from "node:test";
+﻿import test from "node:test";
 import assert from "node:assert/strict";
-import { quartic, invQuartic, toAccum, finalizeRow, observeTradeId, mergeRoundLists } from "../collect.mjs";
+import { quartic, invQuartic, toAccum, finalizeRow, observeTradeId, mergeRoundLists, weiToEth } from "../collect.mjs";
+import { resolveRequest, isInside, site, data } from "../serve.mjs";
+import path from "node:path";
 
 test("quartic matches the ArbOS-51 table from the governor design doc", () => {
   assert.ok(Math.abs(quartic(0.5) - 1.65) < 0.01);
@@ -77,4 +79,76 @@ test("mergeRoundLists joins the same round across a closed seam and renumbers", 
   assert.equal(m2.length, 2); assert.equal(m2[1].startKnown, false);
   // open seam: never merge
   assert.equal(mergeRoundLists(bf, lv, false).length, 3);
+});
+
+// --- exact wei arithmetic (M4) ------------------------------------------------
+// A base fee of 10 gwei is 1e16 wei, already past 2^53 (~9.007e15). Doing the fee
+// math as floats loses low-order wei and makes totals order-dependent.
+test("weiToEth is exact past the 2^53 float boundary", () => {
+  const gwei = 1000000000n;
+  assert.equal(weiToEth(0n), 0);
+  assert.equal(weiToEth(1n), 1e-18);
+  assert.equal(weiToEth(gwei), 1e-9);
+  assert.equal(weiToEth(gwei * 1000000000n), 1);
+  // 3e23 wei is exactly representable as a double, so it round-trips either way. Use a
+  // gas count whose wei product is NOT representable: the float path drifts in the tail.
+  const exact = 12345678901n * (10n * gwei);
+  assert.equal(weiToEth(exact), 123.45678901);
+  const approx = Number(exact) / 1e18;
+  assert.equal(approx, 123.45678901000001, "float path is the imprecise one");
+  assert.notEqual(approx, weiToEth(exact), "the BigInt path must be the exact one");
+  // A value with a long tail must keep every digit it can.
+  assert.equal(weiToEth(1234567890123456789n), 1.2345678901234567);
+});
+
+test("weiToEth handles negative values", () => {
+  assert.equal(weiToEth(-1000000000000000000n), -1);
+  assert.equal(weiToEth(-1000000000n), -1e-9);
+  assert.ok(weiToEth(-1n) < 0);
+  assert.equal(weiToEth(-1500000000000000000n), -1.5);
+});
+
+// --- preview-server path resolution (C1, C2) ---------------------------------
+test("isInside respects path-separator boundaries, not string prefixes", () => {
+  assert.ok(isInside("C:\\a\\data", "C:\\a\\data"));
+  assert.ok(isInside("C:\\a\\data", "C:\\a\\data\\index.json"));
+  // A sibling whose name merely STARTS WITH "data" must not count as inside "data".
+  assert.ok(!isInside("C:\\a\\data", "C:\\a\\database\\secret.txt"));
+  assert.ok(!isInside("C:\\a\\site", "C:\\a\\siteX\\index.html"));
+});
+
+test("serve: traversal out of data/ and site/ is refused", () => {
+  // The two shapes the old startsWith() prefix check let through.
+  assert.equal(resolveRequest("/data/../database/secret.txt"), null);
+  assert.equal(resolveRequest("/../siteX/secret.txt"), null);
+  assert.equal(resolveRequest("/data/../../package.json"), null);
+  assert.equal(resolveRequest("/../../../../Windows/win.ini"), null);
+  // A /data/ request may not re-root itself into site/.
+  assert.equal(resolveRequest("/data/../site/app.js"), null);
+});
+
+test("serve: malformed percent-encoding is refused instead of throwing", () => {
+  // decodeURIComponent("%") throws URIError; uncaught, it killed the whole server.
+  for (const bad of ["/%", "/%zz", "/data/%", "/%e0%a4%a"]) {
+    assert.equal(resolveRequest(bad), null, bad);
+  }
+  // NUL must never reach node:fs (ERR_INVALID_ARG_VALUE).
+  assert.equal(resolveRequest("/%00"), null);
+  assert.equal(resolveRequest("/data/index.json%00.txt"), null);
+});
+
+test("serve: legitimate requests still resolve", () => {
+  assert.equal(resolveRequest("/"), path.join(site, "index.html"));
+  assert.equal(resolveRequest("/app.js"), path.join(site, "app.js"));
+  assert.equal(resolveRequest("/data/index.json"), path.join(data, "index.json"));
+  assert.equal(resolveRequest("/data/days/2026-09-08.json"), path.join(data, "days", "2026-09-08.json"));
+  // A query string is not part of the filesystem path.
+  assert.equal(resolveRequest("/app.js?v=2"), path.join(site, "app.js"));
+  // A percent-escaped but legitimate name still decodes.
+  assert.equal(resolveRequest("/data/index%2Ejson"), path.join(data, "index.json"));
+});
+
+test("serve: /data with no file after it is refused", () => {
+  assert.equal(resolveRequest("/data"), null);
+  assert.equal(resolveRequest("/data/"), null);
 });

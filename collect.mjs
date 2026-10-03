@@ -37,6 +37,7 @@
 //   BLOCK_RECEIPT_BATCH eth_getBlockReceipts items per batch request (default 10)
 //   CONCURRENCY        parallel batch requests per endpoint (default 1; public RPCs throttle above that)
 //   CHUNK_BLOCKS       blocks per checkpoint (default 4000)
+//   RETENTION_DAYS     day files kept under data/days (default 45; 0 = keep all)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -49,22 +50,55 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENDPOINTS = (process.env.RPC_URLS ||
   "https://sepolia-rollup.arbitrum.io/rpc,https://arbitrum-sepolia-rpc.publicnode.com,https://arbitrum-sepolia.rpc.thirdweb.com,https://api.zan.top/arb-sepolia")
   .split(",").map((s) => s.trim()).filter(Boolean);
+// Validate every endpoint eagerly: an unparseable RPC_URLS entry used to surface as an
+// opaque "Invalid URL" from inside the retry loop, hours into a run.
+for (const ep of ENDPOINTS) {
+  let u;
+  try { u = new URL(ep); } catch { throw new Error(`RPC_URLS entry is not a valid URL: ${ep}`); }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error(`RPC_URLS entry must be http(s): ${ep}`);
+}
+if (ENDPOINTS.length === 0) throw new Error("RPC_URLS resolved to zero endpoints");
+
 const TRACKED = (process.env.TRACKED ||
   "prod=0xA1467Ffdc95CD2821736ee5b044E14E72CB80FD4,staging=0x3f29c4ac2f18a6963dfe3dddb53efefeb3c8e594")
-  .split(",").map((s) => s.trim()).filter(Boolean).map((kv) => { const [name, addr] = kv.split("="); return { name: name.trim(), addr: addr.trim().toLowerCase() }; });
+  .split(",").map((s) => s.trim()).filter(Boolean).map((kv) => { const [name, addr] = kv.split("="); return { name: name.trim(), addr: (addr || "").trim().toLowerCase() }; });
+// Reject malformed entries here rather than letting an `undefined` address reach
+// eth_getLogs, where it silently returns nothing and every metric reads zero.
+if (TRACKED.length === 0) throw new Error("TRACKED resolved to zero contracts");
+for (const t of TRACKED) {
+  if (!t.name) throw new Error(`TRACKED entry has no name: ${JSON.stringify(t)}`);
+  if (!/^0x[0-9a-f]{40}$/.test(t.addr)) throw new Error(`TRACKED entry ${t.name} has an invalid address: ${t.addr || "(empty)"}`);
+}
+if (new Set(TRACKED.map((t) => t.name)).size !== TRACKED.length) throw new Error("TRACKED has duplicate names");
+if (new Set(TRACKED.map((t) => t.addr)).size !== TRACKED.length) throw new Error("TRACKED has duplicate addresses");
 const NAMES = TRACKED.map((t) => t.name);
 const CKEYS = [...NAMES, "all"];
 const ADDR_TO_NAME = new Map(TRACKED.map((t) => [t.addr, t.name]));
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const LIVE_HOURS = Number(process.env.LIVE_HOURS || 6);
-const BACKFILL_DAYS = Number(process.env.BACKFILL_DAYS || 3);
-const MAX_RUN_MS = Number(process.env.MAX_RUN_MINUTES || 45) * 60_000;
-const SAMPLE_EVERY = Number(process.env.SAMPLE_EVERY || 200);
-const HEADER_BATCH = Number(process.env.HEADER_BATCH || 100);
-const TX_RECEIPT_BATCH = Number(process.env.TX_RECEIPT_BATCH || 100);
-const BLOCK_RECEIPT_BATCH = Number(process.env.BLOCK_RECEIPT_BATCH || 10);
-const CONCURRENCY = Number(process.env.CONCURRENCY || 1);
-const CHUNK = Number(process.env.CHUNK_BLOCKS || 4000);
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
+
+/** Read a positive-integer env var, falling back to `dflt` on absent/garbage/<=0 values.
+ *  Without this a stray `MAX_RUN_MINUTES=abc` yields NaN, which makes `budgetLeft()`
+ *  NaN — never <= 0, so the run never stops and the Actions job dies at timeout. */
+function envPositiveInt(name, dflt) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.warn(`WARNING: ${name}=${JSON.stringify(raw)} is not a positive number; using ${dflt}`);
+    return dflt;
+  }
+  return Math.floor(n);
+}
+
+const LIVE_HOURS = envPositiveInt("LIVE_HOURS", 6);
+const BACKFILL_DAYS = envPositiveInt("BACKFILL_DAYS", 3);
+const MAX_RUN_MS = envPositiveInt("MAX_RUN_MINUTES", 45) * 60_000;
+const SAMPLE_EVERY = envPositiveInt("SAMPLE_EVERY", 200);
+const HEADER_BATCH = envPositiveInt("HEADER_BATCH", 100);
+const TX_RECEIPT_BATCH = envPositiveInt("TX_RECEIPT_BATCH", 100);
+const BLOCK_RECEIPT_BATCH = envPositiveInt("BLOCK_RECEIPT_BATCH", 10);
+const CONCURRENCY = envPositiveInt("CONCURRENCY", 1);
+const CHUNK = envPositiveInt("CHUNK_BLOCKS", 4000);
 const CONFIRMATIONS = 20; // stay behind the tip; Arbitrum reorgs are rare but the sequencer feed can lag
 
 const ARB_GAS_INFO = "0x000000000000000000000000000000000000006c";
@@ -97,6 +131,7 @@ function pickEndpoint() {
   return best;
 }
 let throttleEvents = 0;
+let untrackedLogs = 0; // logs an endpoint returned outside the tracked-address filter
 /** Send a JSON-RPC batch; returns replies in request order. Retries on 429 / 5xx / network
  *  errors (and hops endpoints on per-item errors, e.g. a method one provider lacks). */
 async function rpcBatch(calls) {
@@ -104,17 +139,25 @@ async function rpcBatch(calls) {
   const body = JSON.stringify(calls.map((c, i) => ({ jsonrpc: "2.0", id: i, method: c.method, params: c.params })));
   const MAX_ATTEMPTS = 20;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const { ep, readyAt } = pickEndpoint();
+    // Never start a request that cannot finish inside the run budget: sleeping through
+    // a 10-minute penalty box used to burn the whole budget on a single call.
+    const picked = pickEndpoint();
+    if (!picked) break;
+    const { ep, readyAt } = picked;
     const p = pace.get(ep);
     const wait = readyAt - Date.now();
-    if (wait > 0) await sleep(Math.min(wait, 30_000));
+    if (wait > 0) {
+      if (wait > budgetLeft()) { log(`  would need ${Math.round(wait / 1000)}s to reach ${new URL(ep).host}, past the run budget — giving up`); break; }
+      await sleep(Math.min(wait, 30_000));
+    }
     p.nextAt = Date.now() + p.minInterval;
     try {
       const res = await fetch(ep, { method: "POST", headers: { "content-type": "application/json" }, body, signal: AbortSignal.timeout(120_000) });
       let throttled = res.status === 429 || res.status >= 500 || res.status === 403;
       let arr = null;
       if (!throttled) {
-        const json = await res.json();
+        let json;
+        try { json = await res.json(); } catch (e) { throw new Error(`non-JSON response from ${ep}: HTTP ${res.status}`); }
         arr = Array.isArray(json) ? json : [json];
         throttled = arr.some((r) => r.error && (r.error.code === 429 || r.error.code === -32005 || r.error.code === -32012 || /rate|too many|limit exceeded|no longer/i.test(r.error.message || "")));
       }
@@ -128,9 +171,23 @@ async function rpcBatch(calls) {
       }
       p.strikes = 0;
       p.minInterval = Math.max(150, p.minInterval * 0.93);
+      // Allocate exactly calls.length slots: a hostile or buggy endpoint replying with an
+      // out-of-range id used to grow `out` to that id, i.e. a ~1e9-element sparse array.
       const out = new Array(calls.length);
-      for (const r of arr) out[r.id] = r;
-      for (let i = 0; i < calls.length; i++) if (!out[i]) throw new Error(`missing id ${i} in batch reply`);
+      let malformed = false;
+      for (const r of arr) {
+        if (!r || !Number.isInteger(r.id) || r.id < 0 || r.id >= calls.length) { malformed = true; break; }
+        if (out[r.id] !== undefined) { malformed = true; break; } // duplicate id
+        out[r.id] = r;
+      }
+      if (!malformed) for (let i = 0; i < calls.length; i++) if (!out[i]) { malformed = true; break; }
+      if (malformed) {
+        // A malformed reply is the endpoint's fault, not the data's — penalise it briefly
+        // and retry elsewhere rather than surfacing a misleading "missing id" error.
+        p.strikes++; p.cooldownUntil = Date.now() + 2000;
+        log(`  ${new URL(ep).host}: malformed batch reply (${calls[0].method} ×${calls.length}) — retrying on another endpoint`);
+        continue;
+      }
       // per-item errors (unsupported method, "metadata not found", …): try another endpoint first
       if (out.some((r) => r.error) && attempt < 3 && ENDPOINTS.length > 1) { p.cooldownUntil = Date.now() + 2000; continue; }
       return out;
@@ -172,6 +229,19 @@ const hex = (n) => "0x" + n.toString(16);
 const toInt = (h) => Number.parseInt(h, 16);
 const toBig = (h) => BigInt(h);
 const WEI = 1e18;
+/** Convert an exact wei BigInt to ETH without first routing it through a JS float.
+ *  Splitting at 1e9 keeps the division in BigInt and preserves ~18 significant digits,
+ *  which a direct `Number(wei) / 1e18` does not once wei exceeds 2^53 (~9.0e15, i.e.
+ *  just 9 gwei — a normal Arbitrum base fee is already past that). */
+export function weiToEth(wei) {
+  const v = wei < 0n ? -wei : wei;
+  const neg = wei < 0n;
+  const scaled = v / 1000000000n;
+  const frac = v % 1000000000n;
+  return (neg ? -1 : 1) * (Number(scaled) + Number(frac) / 1e9) / 1e9;
+}
+/** floor of `state.minBaseFee` expressed in wei, for exact BigInt comparisons. */
+const minBaseFeeWei = () => BigInt(Math.round(state?.minBaseFee ?? 0));
 const dayOf = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
 const readJson = (p, fallback) => (fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : fallback);
 function writeJson(p, obj) {
@@ -216,14 +286,28 @@ async function readChainParams() {
     { method: "eth_call", params: [{ to: ARB_GAS_INFO, data: "0xf918379a" }, "latest"] }, // getMinimumGasPrice()
     { method: "eth_call", params: [{ to: ARB_GAS_INFO, data: "0x232027d1" }, "latest"] }, // getGasPricingConstraints()
   ]);
+  // Neither reply was error-checked: a failing eth_call produced `Number(BigInt(undefined))`
+  // -> a thrown TypeError, or an empty slice that made .match() return null -> a TypeError
+  // on .map. Both aborted the whole run instead of just this refresh.
+  if (minRes.error || minRes.result == null) throw new Error(`getMinimumGasPrice: ${minRes.error?.message || "empty result"}`);
+  if (conRes.error || conRes.result == null) throw new Error(`getGasPricingConstraints: ${conRes.error?.message || "empty result"}`);
   const minBaseFee = Number(BigInt(minRes.result));
-  const words = conRes.result.slice(2).match(/.{64}/g).map((w) => Number(BigInt("0x" + w)));
-  const n = words[1];
+  if (!Number.isFinite(minBaseFee) || minBaseFee <= 0) throw new Error(`getMinimumGasPrice returned an unusable value: ${minRes.result}`);
+  const hexBody = String(conRes.result);
+  const words = hexBody.slice(2).match(/.{64}/g);
+  if (!words || words.length < 5) throw new Error(`getGasPricingConstraints returned an undecodable payload: ${hexBody.slice(0, 80)}`);
+  const decoded = words.map((w) => Number(BigInt("0x" + w)));
+  const n = decoded[1];
+  // The count is chain-supplied; a corrupt value must not drive a huge allocation/loop.
+  if (!Number.isInteger(n) || n < 0 || decoded.length < 2 + n * 3) throw new Error(`getGasPricingConstraints: inconsistent count ${n} for ${decoded.length} words`);
   const constraints = [];
   for (let i = 0; i < n; i++) {
-    const [target, window, backlog] = words.slice(2 + i * 3, 5 + i * 3);
+    const [target, window, backlog] = decoded.slice(2 + i * 3, 5 + i * 3);
+    // A zero window would make every E term a division by zero (Infinity in the model).
+    if (!target || !window) throw new Error(`constraint ${i} has target=${target} window=${window}`);
     constraints.push({ target, window, backlog });
   }
+  if (constraints.length === 0) throw new Error("getGasPricingConstraints returned no constraints; cannot price the model");
   return { minBaseFee, constraints };
 }
 
@@ -350,9 +434,18 @@ async function processChunk(cur, from, to) {
       const r = res[i];
       if (r.error || !r.result) throw new Error(`header ${g[i].params[0]}: ${r.error?.message || "null"}`);
       const h = r.result;
-      headers[toInt(h.number) - from] = { n: toInt(h.number), ts: toInt(h.timestamp), gasUsed: toInt(h.gasUsed), baseFee: Number(toBig(h.baseFeePerGas)) };
+      const n = toInt(h.number);
+      // A provider that answers with a block outside the requested range used to write
+      // outside the array, leaving a hole that later crashed the walk with "cannot read
+      // properties of undefined". Ignore it here; the hole check below turns it into a
+      // precise, retryable error for the whole chunk.
+      if (n < from || n > to) continue;
+      headers[n - from] = { n, ts: toInt(h.timestamp), gasUsed: toInt(h.gasUsed), baseFee: Number(toBig(h.baseFeePerGas)) };
     }
   });
+  for (let i = 0; i < headers.length; i++) {
+    if (!headers[i]) throw new Error(`no header returned for block ${from + i} (of ${from}-${to})`);
+  }
 
   // 2. tracked txs via logs (split on the provider's result limit)
   const logs = [];
@@ -371,8 +464,14 @@ async function processChunk(cur, from, to) {
   const txs = new Map(); // hash → { n, who, trades, failed, ids }
   for (const l of logs) {
     const h = l.transactionHash;
+    // eth_getLogs is filtered by address, but a provider that ignores the filter (or a
+    // reorg/misindexed node) can return logs from anywhere. Without this guard the lookup
+    // returned undefined, which then became a key on the accumulator objects and threw
+    // "Cannot read properties of undefined (reading 'gas')" and lost the whole chunk.
+    const who = ADDR_TO_NAME.get(String(l.address || "").toLowerCase());
+    if (!who) { untrackedLogs++; continue; }
     let t = txs.get(h);
-    if (!t) { t = { n: toInt(l.blockNumber), who: ADDR_TO_NAME.get(l.address.toLowerCase()), trades: 0, failed: 0, ids: [] }; txs.set(h, t); }
+    if (!t) { t = { n: toInt(l.blockNumber), who, trades: 0, failed: 0, ids: [] }; txs.set(h, t); }
     // Match by signature hash first; fall back to event SHAPE so a proxy upgrade that
     // re-declares TradeSettled (topic0 changes) cannot silently zero the trade count.
     // TradeSettled: 3 indexed (tradeId, buyer, seller) + 6 words of data.
@@ -395,7 +494,11 @@ async function processChunk(cur, from, to) {
       const t = txs.get(g[i].params[0]);
       t.gasUsed = toInt(rc.gasUsed);
       t.l1Gas = rc.gasUsedForL1 ? toInt(rc.gasUsedForL1) : 0;
-      t.price = Number(toBig(rc.effectiveGasPrice));
+      // effectiveGasPrice is wei, which routinely exceeds 2^53 (9e15) once expressed as a
+      // float. Keep the exact BigInt alongside it and do all wei math on the BigInt, so a
+      // receipt's fee is bit-exact instead of order-dependent across float summation.
+      t.priceWei = rc.effectiveGasPrice == null ? 0n : toBig(rc.effectiveGasPrice);
+      t.price = Number(t.priceWei);
       t.from = rc.from.toLowerCase();
     }
   });
@@ -479,13 +582,24 @@ async function processChunk(cur, from, to) {
     for (const t of ours) for (const k of [t.who, "all"]) {
       const c = row.c[k];
       c.txs++; c.gas += t.gasUsed; c.l1Gas += t.l1Gas; c.trades += t.trades; c.failed += t.failed;
-      c.feeEth += (t.gasUsed * t.price) / WEI;
-      c.premiumEth += (t.gasUsed * Math.max(0, t.price - state.minBaseFee)) / WEI;
-      c.selfPremiumEth += (t.gasUsed * t.price * uplift[k]) / WEI;
+      // Wei math is exact: gasUsed * effectiveGasPrice routinely exceeds 2^53, so summing
+      // it as a float silently lost precision and made the published ETH totals depend on
+      // the order transactions happened to be visited in. The division is done in BigInt
+      // and scaled to ETH once, keeping ~18 significant digits of the wei total.
+      const minWei = minBaseFeeWei();
+      const feeEth = weiToEth(BigInt(t.gasUsed) * t.priceWei);
+      c.feeEth += feeEth;
+      c.premiumEth += weiToEth(BigInt(t.gasUsed) * (t.priceWei > minWei ? t.priceWei - minWei : 0n));
+      // selfPremiumEth is an attribution share of the fee we just computed exactly, so it
+      // is derived from that value rather than re-running the wei product with a float ratio.
+      c.selfPremiumEth += feeEth * uplift[k];
     }
     for (const k of CKEYS) {
       row.c[k].qNoSum += qNo[k];
-      row.c[k].causedEth += (Math.max(0, h.gasUsed - gasBy[k]) * h.baseFee * uplift[k]) / WEI;
+      // The gas-not-ours * baseFee product also passes 2^53 on a busy block (30M gas * 10 gwei
+      // wei is ~3e17), so it is computed in BigInt and the uplift share is applied as a
+      // fixed-point millionth to stay exact rather than multiplying wei by a float ratio.
+      row.c[k].causedEth += weiToEth(BigInt(Math.max(0, h.gasUsed - gasBy[k])) * BigInt(Math.round(h.baseFee)) * BigInt(Math.round(uplift[k] * 1e6))) / 1e6;
     }
 
     const s = sampled.get(h.n);
@@ -570,15 +684,40 @@ function mergedRounds() {
   const seamClosed = !backfill || backfill.lastBlock >= backfill.endBlock;
   return Object.fromEntries(NAMES.map((k) => [k, mergeRoundLists(backfill ? backfill.rounds[k] : [], live.rounds[k], seamClosed)]));
 }
+/** Days of minute rows kept on disk. Older day files are pruned after this many, so RAM,
+ *  per-run I/O, the published _site bundle and the repo's git history stay bounded instead
+ *  of growing forever at ~1440 rows per day. Set RETENTION_DAYS=0 to keep everything. */
+const RETENTION_DAYS = envPositiveInt("RETENTION_DAYS", 45);
+
+/** Delete day files older than the retention window (pure decision, side-effecting write). */
+function pruneOldDays(daysDir, days) {
+  if (RETENTION_DAYS === 0 || days.length <= RETENTION_DAYS) return [];
+  const doomed = days.slice(0, days.length - RETENTION_DAYS);
+  for (const date of doomed) {
+    // The in-memory cache is only this run's work; drop the entry so a later write in the
+    // same process cannot resurrect a file we just deleted.
+    dayCache.delete(date);
+    try { fs.unlinkSync(path.join(daysDir, `${date}.json`)); } catch { /* already gone */ }
+  }
+  log(`pruned ${doomed.length} day file(s) older than ${RETENTION_DAYS} days (${doomed[0]}..${doomed[doomed.length - 1]})`);
+  return doomed;
+}
+
 function writeIndex() {
   const daysDir = path.join(DATA_DIR, "days");
   const days = fs.existsSync(daysDir) ? fs.readdirSync(daysDir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)).sort() : [];
+  pruneOldDays(daysDir, days);
   const summaries = days.map((date) => {
     const rows = Object.values(dayCache.get(date)?.rows || readJson(path.join(daysDir, `${date}.json`), { rows: {} }).rows);
-    const s = { date, minutes: rows.length, blocks: 0, chainGas: 0, baseFeeMax: 0, firstT: Infinity, lastT: 0, c: Object.fromEntries(CKEYS.map((k) => [k, { gas: 0, txs: 0, trades: 0, feeEth: 0 }])) };
+    // `firstT` must never stay Infinity for a day with no rows: the page computes
+    // Math.min(...days.map(d => d.firstT)), and Math.min(Infinity) -> 0, which made the
+    // range span from the epoch and iterate ~29.8M minute buckets (a frozen tab).
+    const s = { date, minutes: rows.length, blocks: 0, chainGas: 0, baseFeeMax: 0, firstT: null, lastT: 0, c: Object.fromEntries(CKEYS.map((k) => [k, { gas: 0, txs: 0, trades: 0, feeEth: 0 }])) };
     for (const r of rows) {
       const f = "baseFeeAvg" in r ? r : finalizeRow(r);
-      s.blocks += f.blocks; s.chainGas += f.chainGas; s.baseFeeMax = Math.max(s.baseFeeMax, f.baseFeeMax); s.firstT = Math.min(s.firstT, f.t); s.lastT = Math.max(s.lastT, f.t);
+      s.blocks += f.blocks; s.chainGas += f.chainGas; s.baseFeeMax = Math.max(s.baseFeeMax, f.baseFeeMax);
+      s.firstT = s.firstT === null ? f.t : Math.min(s.firstT, f.t);
+      s.lastT = Math.max(s.lastT, f.t);
       for (const k of CKEYS) { const x = f.c[k]; s.c[k].gas += x.gas; s.c[k].txs += x.txs; s.c[k].trades += x.trades; s.c[k].feeEth += x.feeEth; }
     }
     return s;
@@ -601,6 +740,9 @@ function writeIndex() {
     fit: live.fit,
     eventStats: state.eventStats,
     lastError: state.lastError || null,
+    // Diagnostics surfaced by renderMeta(): a non-zero value means an endpoint returned logs
+    // outside the tracked-address filter and we discarded them rather than crashing.
+    untrackedLogs,
     rounds: mergedRounds(),
     labels,
     days: summaries,
@@ -618,6 +760,9 @@ if (isMain) (async () => {
     // refresh the chain params each run (an ArbOwner change to the schedule would silently skew the model)
     const { minBaseFee, constraints } = await readChainParams();
     if (constraints.length === state.constraints.length) state.constraints = constraints.map(({ target, window }) => ({ target, window }));
+    // Guard against a zero floor: every "x times min" ratio on the page divides by this
+    // value, and a persisted 0 would render as Infinity and persist across every later run.
+    if (!Number.isFinite(minBaseFee) || minBaseFee <= 0) throw new Error(`chain reported an unusable minimum base fee: ${minBaseFee}`);
     state.minBaseFee = minBaseFee;
     state.eventStats ||= { tradeSettledByShape: 0, failedByShape: 0, other: 0 };
   }
