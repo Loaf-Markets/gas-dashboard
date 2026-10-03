@@ -5,11 +5,25 @@
   const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
   const state = { meta: null, days: new Map(), range: "24h", gran: "hour", focus: null, custom: null, charts: {}, tab: "overview" };
 
+  // ───────── escaping ─────────
+  // Several data sources reach innerHTML below: labels.json (repo-controlled but still a
+  // file), TRACKED names from the environment, and error text copied out of an RPC reply.
+  // An RPC endpoint is a remote third party, so any of those could inject markup.
+  // Everything interpolated into an HTML string goes through esc() first.
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  /** Escape only for use inside an HTML attribute value delimited by double quotes. */
+  const escAttr = (s) => esc(s).replace(/`/g, "&#96;");
+
   // ───────── formatting ─────────
   const fmtGas = (g) => g >= 1e9 ? (g / 1e9).toFixed(2) + " Ggas" : g >= 1e6 ? (g / 1e6).toFixed(2) + " Mgas" : g >= 1e3 ? (g / 1e3).toFixed(1) + " kgas" : Math.round(g) + " gas";
   const fmtGasAxis = (g) => g >= 1e9 ? (g / 1e9).toFixed(1) + "G" : g >= 1e6 ? (g / 1e6).toFixed(0) + "M" : g >= 1e3 ? (g / 1e3).toFixed(0) + "k" : String(g);
-  const fmtEth = (e) => e >= 1 ? e.toFixed(3) + " ETH" : e >= 1e-3 ? e.toFixed(5) + " ETH" : (e * 1e6).toFixed(1) + " µETH";
-  const fmtPct = (x, d = 1) => (x * 100).toFixed(d) + "%";
+  const fmtEth = (e) => {
+    // A non-finite total (an all-zero range, or a divide-by-zero upstream) used to render
+    // the literal strings "Infinity" / "NaN" into the page.
+    if (!Number.isFinite(e)) return "–";
+    return e >= 1 ? e.toFixed(3) + " ETH" : e >= 1e-3 ? e.toFixed(5) + " ETH" : (e * 1e6).toFixed(1) + " µETH";
+  };
+  const fmtPct = (x, d = 1) => Number.isFinite(x) ? (x * 100).toFixed(d) + "%" : "–";
   const fmtNum = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 0 });
   const fmtGwei = (wei) => (wei / 1e9).toFixed(3) + " gwei";
   const pad = (n) => String(n).padStart(2, "0");
@@ -23,8 +37,8 @@
   const fmtDur = (s) => s >= 86400 ? (s / 86400).toFixed(1) + " d" : s >= 3600 ? (s / 3600).toFixed(1) + " h" : Math.round(s / 60) + " min";
   const short = (a) => a.length > 20 ? a.slice(0, 6) + "…" + a.slice(-4) : a;
   const label = (a) => (state.meta.labels && state.meta.labels[a]) || null;
-  const explorer = (a) => `https://sepolia.arbiscan.io/address/${a}`;
-  const focusName = () => state.focus === "all" ? "Loaf (all contracts)" : `Loaf ${state.focus}`;
+  const explorer = (a) => `https://sepolia.arbiscan.io/address/${encodeURIComponent(String(a))}`;
+  const focusName = () => state.focus === "all" ? "Loaf (all contracts)" : `Loaf ${esc(state.focus)}`;
   const trackedAddrs = () => new Set(state.meta.tracked.map((t) => t.addr));
   const focusAddrs = () => state.focus === "all" ? trackedAddrs() : new Set(state.meta.tracked.filter((t) => t.name === state.focus).map((t) => t.addr));
 
@@ -38,7 +52,13 @@
   function currentRange() {
     const m = state.meta;
     const end = m.lastBlockTs;
-    const first = Math.min(...m.days.map((d) => d.firstT));
+    // A day with no rows reports firstT: null (it used to report Infinity, and
+    // Math.min(Infinity) is 0, which stretched the range from the epoch and made
+    // minuteRows() build ~29.8M empty rows — a frozen tab). Ignore nulls entirely.
+    const known = m.days.map((d) => d.firstT).filter((t) => typeof t === "number" && Number.isFinite(t));
+    if (known.length === 0) return [0, 60];
+    const first = Math.min(...known);
+    if (!Number.isFinite(end)) return [first, first + 60];
     if (state.range === "custom" && state.custom) return [Math.max(first, state.custom[0]), Math.min(end + 60, state.custom[1])];
     const span = { "6h": 6 * 3600, "24h": 86400, "3d": 3 * 86400, "7d": 7 * 86400 }[state.range];
     if (!span) return [first, end + 60];
@@ -50,7 +70,10 @@
   /** Minute rows in [a, b), zero-filled where the chain produced no block. */
   function minuteRows(a, b) {
     const rows = [];
-    for (let t = Math.floor(a / 60) * 60; t < b; t += 60) {
+    // Hard cap: a mistyped custom range (or a corrupt firstT) must not be able to build
+    // tens of millions of empty rows and lock the tab. 400k rows ~ 277 days of minutes.
+    const MAX_ROWS = 400000;
+    for (let t = Math.floor(a / 60) * 60; t < b && rows.length < MAX_ROWS; t += 60) {
       const d = state.days.get(dayOf(t));
       const r = d && d.rows[t];
       rows.push(r || { t, blocks: 0, chainGas: 0, sampled: 0, sampledTxs: 0, baseFeeAvg: 0, baseFeeMax: 0, baseFeeMin: 0, qAct: 0, qModel: 0, qMax: 0, c: {} });
@@ -59,7 +82,9 @@
   }
   const cf = (r) => r.c[state.focus] || EMPTY_C;
   function emptyBucket(t, key) {
-    return { t, key, seconds: 0, blocks: 0, chainGas: 0, sampled: 0, sampledTxs: 0, ourTxs: 0, ourGas: 0, ourTrades: 0, ourFailed: 0, ourFeeEth: 0, ourPremiumEth: 0, ourSelfPremiumEth: 0, othersPremiumCausedEth: 0, bfW: 0, qActW: 0, qNoUsW: 0, qModelW: 0, baseFeeMax: 0, qMax: 0, upliftW: 0, per: {} };
+    // `per` is keyed by contract name from the collected JSON, so it gets a null prototype:
+    // a "__proto__" key then becomes a plain own property instead of mutating Object.prototype.
+    return { t, key, seconds: 0, blocks: 0, chainGas: 0, sampled: 0, sampledTxs: 0, ourTxs: 0, ourGas: 0, ourTrades: 0, ourFailed: 0, ourFeeEth: 0, ourPremiumEth: 0, ourSelfPremiumEth: 0, othersPremiumCausedEth: 0, bfW: 0, qActW: 0, qNoUsW: 0, qModelW: 0, baseFeeMax: 0, qMax: 0, upliftW: 0, per: Object.create(null) };
   }
   function addRow(b, r) {
     const c = cf(r);
@@ -70,7 +95,14 @@
     b.bfW += r.baseFeeAvg * r.blocks; b.qActW += r.qAct * r.blocks; b.qNoUsW += c.qNo * r.blocks; b.qModelW += r.qModel * r.blocks;
     b.upliftW += (r.qAct > 0 ? 1 - c.qNo / r.qAct : 0) * r.blocks;
     b.baseFeeMax = Math.max(b.baseFeeMax, r.baseFeeMax); b.qMax = Math.max(b.qMax, r.qMax);
-    for (const [k, x] of Object.entries(r.c)) { const p = b.per[k] || (b.per[k] = { gas: 0, txs: 0, trades: 0, feeEth: 0 }); p.gas += x.gas; p.txs += x.txs; p.trades += x.trades; p.feeEth += x.feeEth; }
+    // Guard against prototype-chain keys. `k` comes from address keys in the collected
+    // JSON, and a "__proto__" key here would assign onto Object.prototype instead of
+    // creating an own property (Object.create(null) below is the real fix; this is the
+    // belt to that braces).
+    for (const [k, x] of Object.entries(r.c)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+      const p = b.per[k] || (b.per[k] = { gas: 0, txs: 0, trades: 0, feeEth: 0 }); p.gas += x.gas; p.txs += x.txs; p.trades += x.trades; p.feeEth += x.feeEth;
+    }
   }
   function finish(b) {
     const w = b.blocks || 1;
@@ -225,9 +257,9 @@
     const top = list.slice(0, 15);
     const sampledTotal = list.reduce((s, [, v]) => s + v[0], 0) + otherGas;
     $("#top-sub").textContent = `Estimated from full receipts of 1 in ${N} blocks (${fmtNum(sampledBlocks)} sampled blocks in range, scaled ×${N}). ${focusName()}'s exact total in this range is ${fmtGas(tot.ourGas)} (${fmtPct(tot.share)} of chain gas). Loaf contracts are highlighted.`;
-    mount("#c-top", { type: "bar", data: { labels: top.map(([addr]) => label(addr) || short(addr)), datasets: [{ label: "Estimated gas", data: top.map(([, v]) => v[0] * N), backgroundColor: top.map(([addr]) => focus.has(addr) ? th.ours : tracked.has(addr) ? th.s3 : th.rest), borderRadius: 3, borderSkipped: false, fmt: fmtGas }] },
+      mount("#c-top", { type: "bar", data: { labels: top.map(([addr]) => esc(label(addr) || short(addr))), datasets: [{ label: "Estimated gas", data: top.map(([, v]) => v[0] * N), backgroundColor: top.map(([addr]) => focus.has(addr) ? th.ours : tracked.has(addr) ? th.s3 : th.rest), borderRadius: 3, borderSkipped: false, fmt: fmtGas }] },
       options: { responsive: true, maintainAspectRatio: false, animation: false, indexAxis: "y", plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ` ${fmtGas(c.parsed.x)}` } } }, scales: { x: { ticks: { color: th.text, callback: (v) => fmtGasAxis(v) }, grid: { color: th.grid }, border: { display: false }, beginAtZero: true }, y: { ticks: { color: th.text, autoSkip: false }, grid: { display: false } } } } });
-    const rowsHtml = list.slice(0, 40).map(([addr, v], i) => `<tr class="${tracked.has(addr) ? "ours" : ""}"><td class="num">${i + 1}</td><td class="mono"><a href="${explorer(addr)}" target="_blank" rel="noopener">${short(addr)}</a></td><td>${label(addr) || ""}</td><td class="num">${fmtGas(v[0] * N)}</td><td class="num">${sampledTotal ? fmtPct(v[0] / sampledTotal) : "–"}</td><td class="num">${fmtNum(v[1] * N)}</td><td class="num">${v[1] ? fmtGas(v[0] / v[1]) : "–"}</td></tr>`).join("");
+    const rowsHtml = list.slice(0, 40).map(([addr, v], i) => `<tr class="${tracked.has(addr) ? "ours" : ""}"><td class="num">${i + 1}</td><td class="mono"><a href="${escAttr(explorer(addr))}" target="_blank" rel="noopener">${esc(short(addr))}</a></td><td>${esc(label(addr) || "")}</td><td class="num">${fmtGas(v[0] * N)}</td><td class="num">${sampledTotal ? fmtPct(v[0] / sampledTotal) : "–"}</td><td class="num">${fmtNum(v[1] * N)}</td><td class="num">${v[1] ? fmtGas(v[0] / v[1]) : "–"}</td></tr>`).join("");
     $("#t-top").innerHTML = `<thead><tr><th class="num">#</th><th>Address</th><th>Label</th><th class="num">Est. gas</th><th class="num">Share (sampled)</th><th class="num">Est. txs</th><th class="num">Gas / tx</th></tr></thead><tbody>${rowsHtml}</tbody>`;
   }
 
@@ -275,7 +307,7 @@
     const lag = Math.floor(Date.now() / 1000) - (m.lastBlockTs || 0);
     const stale = age > 3 * 3600;
     $("#meta").innerHTML = [
-      m.tracked.map((t) => `${t.name} <a class="mono" href="${explorer(t.addr)}" target="_blank" rel="noopener">${short(t.addr)}</a>`).join(" · "),
+      m.tracked.map((t) => `${esc(t.name)} <a class="mono" href="${escAttr(explorer(t.addr))}" target="_blank" rel="noopener">${esc(short(t.addr))}</a>`).join(" · "),
       `chain ${m.chainId}`,
       `<span class="${stale ? "stale" : ""}">updated ${fmtDur(age)} ago${stale ? " (stale)" : ""}</span>`,
       `data through block ${fmtNum(m.lastBlock)} (${fmtDur(lag)} behind now)`,
@@ -283,7 +315,9 @@
         ? `history filling in: ${fmtPct((m.backfill.lastBlock - m.backfill.from) / Math.max(1, m.backfill.endBlock - m.backfill.from), 0)} of the ${fmtDur((m.liveFromTs || m.lastBlockTs) - (m.days.length ? Math.min(...m.days.map((d) => d.firstT)) : m.lastBlockTs))} before ${fmtDateTime(m.liveFromTs || m.lastBlockTs)} (there is a gap until it catches up)`
         : `history since ${fmtDateTime(Math.min(...m.days.map((d) => d.firstT)))}`,
       m.fit ? `replay fit ±${fmtPct(m.fit.medianAbsErr, 1)}` : `model replay warming up`,
-      m.lastError ? `<span class="stale">collector error at ${fmtDateTime(m.lastError.at)} (${m.lastError.cursor} ${fmtNum(m.lastError.from)}–${fmtNum(m.lastError.to)}): ${m.lastError.message}</span>` : "",
+      // m.lastError.message is copied from a remote RPC endpoint's error text and lands in
+      // innerHTML below, so it must be escaped or the endpoint could inject markup.
+      m.lastError ? `<span class="stale">collector error at ${fmtDateTime(m.lastError.at)} (${esc(m.lastError.cursor)} ${fmtNum(m.lastError.from)}–${fmtNum(m.lastError.to)}): ${esc(m.lastError.message)}</span>` : "",
       m.eventStats && (m.eventStats.tradeSettledByShape || m.eventStats.failedByShape) ? `<span class="stale">event signature changed on chain: ${fmtNum(m.eventStats.tradeSettledByShape + m.eventStats.failedByShape)} events matched by shape — check labels.json / collector</span>` : "",
     ].filter(Boolean).join(" · ");
   }
@@ -366,7 +400,7 @@
     const top = list.slice(0, 7); const maxV = top[0]?.[1] || 1;
     $("#s-others").innerHTML = `<h3>Who else is using the chain?</h3>
       <div class="big">${rank ? `#${rank}<small>${name} ranks ${rank === 1 ? "first" : `${rank}${rank === 2 ? "nd" : rank === 3 ? "rd" : "th"}`} among all gas users</small>` : `–<small>not in the sampled top list</small>`}</div>
-      <div class="rank">${top.map(([addr, v]) => `<div class="who ${focus.has(addr) ? "ours" : ""}" title="${addr}">${label(addr) || short(addr)}</div><div class="bar ${focus.has(addr) ? "ours" : tracked.has(addr) ? "other-loaf" : ""}" style="width:${v / maxV * 100}%"></div><div class="n">${sampledTotal ? pct(v / sampledTotal, 1) : "–"}</div>`).join("")}</div>
+      <div class="rank">${top.map(([addr, v]) => `<div class="who ${focus.has(addr) ? "ours" : ""}" title="${escAttr(addr)}">${esc(label(addr) || short(addr))}</div><div class="bar ${focus.has(addr) ? "ours" : tracked.has(addr) ? "other-loaf" : ""}" style="width:${v / maxV * 100}%"></div><div class="n">${sampledTotal ? pct(v / sampledTotal, 1) : "–"}</div>`).join("")}</div>
       <p>Shares are estimated from a sample of blocks. Unlabelled addresses are other projects on the testnet; the biggest ones are usually load generators or other teams' competitions.</p>`;
   }
 
@@ -472,7 +506,7 @@
     seg("#range", "r", (v) => { state.range = v; $("#customRange").hidden = v !== "custom"; if (v !== "custom") { writeHash(); render().catch(showErr); } });
     seg("#gran", "g", (v) => { state.gran = v; writeHash(); render().catch(showErr); });
     const fz = $("#focus");
-    fz.innerHTML = [...state.meta.tracked.map((t) => t.name), "all"].map((n) => `<button data-f="${n}">${n === "all" ? "All Loaf" : n[0].toUpperCase() + n.slice(1)}</button>`).join("");
+    fz.innerHTML = [...state.meta.tracked.map((t) => t.name), "all"].map((n) => `<button data-f="${escAttr(n)}">${n === "all" ? "All Loaf" : esc(n[0].toUpperCase() + n.slice(1))}</button>`).join("");
     seg("#focus", "f", (v) => { state.focus = v; writeHash(); render().catch(showErr); });
     $("#applyCustom").addEventListener("click", () => {
       const f = Date.parse($("#from").value + "Z") / 1000, t = Date.parse($("#to").value + "Z") / 1000;
